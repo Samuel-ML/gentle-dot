@@ -11,6 +11,7 @@ use super::model::{HttpFetcher, ModelError, ModelEvent, ModelEvents, ModelManage
 use super::parakeet::{self, Loader, Locate, Parakeet};
 use super::wake::{self, Chime, WakeWord};
 use super::{ListenEvent, ListenEvents};
+use crate::config::{self, VoiceInput as StoredInput};
 use super::{Events, Transcript, Voice, VoiceError, VoiceEvent, VoiceStatus, UNSUPPORTED};
 use crate::computer::SystemClock;
 use crate::config::DesktopConfig;
@@ -33,24 +34,119 @@ pub const COMMANDS: [&str; 10] = [
     "wake_word_set",
 ];
 
+/// Said when the panel asks to record from a microphone that is not one.
+pub const EMPTY_INPUT: &str = "Choose a microphone to record from.";
+
+
+/// The platform's input devices (UID and display name) and the UID of its default input. A
+/// function rather than a call so the tests answer fixed devices instead of this Mac's.
+type Enumerate = fn() -> (Vec<StoredInput>, Option<String>);
+
+/// macOS asks CoreAudio (S1-S4); elsewhere the system default input is all there is, so the
+/// panel gets an empty list rather than a device it could never select (S7, Linux).
+fn platform_devices() -> (Vec<StoredInput>, Option<String>) {
+    #[cfg(target_os = "macos")]
+    return (
+        super::core_audio::inputs().into_iter().map(|device| StoredInput { uid: device.uid, name: device.name }).collect(),
+        super::core_audio::default_input_uid(),
+    );
+    #[cfg(not(target_os = "macos"))]
+    (Vec::new(), None)
+}
+
+/// The choice in `config.json`, read once at startup, and the file it is written back to.
+fn stored_input() -> (PathBuf, Option<StoredInput>) {
+    let config = config::load_config();
+    (config.data_dir.join("config.json"), config.voice_input)
+}
+
+/// The `voice_input_options` reply: `{devices, chosen, default}`, the two choices as UIDs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InputOptions {
+    /// Every input the Mac reports, in its own order (empty off macOS).
+    pub devices: Vec<StoredInput>,
+    /// The stored UID, or `null` when following the system default.
+    pub chosen: Option<String>,
+    /// The system default input's UID, or `null` while it is not known.
+    pub default: Option<String>,
+}
+
+/// The `voice_input_set` reply: `{chosen}`, the UID that is now stored, or `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InputChoice {
+    pub chosen: Option<String>,
+}
+
 /// Voice input, when this platform has a backend, and the wake word that listens on the same
 /// microphone (S30.7).
 pub struct VoiceInput {
     voice: Option<Voice>,
     wake: Option<Wake>,
+    /// `config.json`, where the microphone choice is kept between recordings and launches (S2).
+    config: PathBuf,
+    /// The stored microphone; `None` follows the system default input.
+    stored: Mutex<Option<StoredInput>>,
+    /// The inputs this platform offers and its default, read when the panel asks.
+    devices: Enumerate,
 }
 
 impl VoiceInput {
     pub fn new(voice: Voice) -> Self {
-        VoiceInput { voice: Some(voice), wake: None }
+        let (config, stored) = stored_input();
+        VoiceInput { voice: Some(voice), wake: None, config, stored: Mutex::new(stored), devices: platform_devices }
     }
 
     pub fn unsupported() -> Self {
-        VoiceInput { voice: None, wake: None }
+        let (config, stored) = stored_input();
+        VoiceInput { voice: None, wake: None, config, stored: Mutex::new(stored), devices: platform_devices }
     }
 
     fn voice(&self) -> Result<&Voice, VoiceError> {
         self.voice.as_ref().ok_or(VoiceError::Unsupported)
+    }
+
+    /// The stored device UID; `None` follows the system default input.
+    fn chosen(&self) -> Option<String> {
+        self.stored.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|input| input.uid.clone())
+    }
+
+    /// The devices the panel may choose from, the stored choice, and the system default.
+    pub fn input_options(&self) -> InputOptions {
+        let (devices, default) = (self.devices)();
+        // The stored choice stays in the answer even when the device is gone, so the panel can
+        // warn about it (S3); a recording from it falls back to the default.
+        InputOptions { devices, chosen: self.chosen(), default }
+    }
+
+    /// Stores the choice (a device UID, or `None` to follow the system default) in `config.json`
+    /// and in the state the next recording reads, and answers with what it stored.
+    pub fn set_input(&self, uid: Option<&str>) -> Result<InputChoice, VoiceError> {
+        let uid = uid.map(str::trim);
+        if uid == Some("") {
+            return Err(VoiceError::Failed(EMPTY_INPUT.to_string()));
+        }
+        let mut stored = self.stored.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let input = uid.map(|uid| StoredInput {
+            // The name is kept for display only (S4): what the device calls itself now, else the
+            // name already stored for it, else the UID, so a device that is gone still reads as
+            // something in the panel.
+            name: (self.devices)()
+                .0
+                .into_iter()
+                .find(|device| device.uid == uid)
+                .map(|device| device.name)
+                .or_else(|| stored.as_ref().filter(|input| input.uid == uid).map(|input| input.name.clone()))
+                .unwrap_or_else(|| uid.to_string()),
+            uid: uid.to_string(),
+        });
+        config::save_voice_input(&self.config, input.as_ref()).map_err(VoiceError::Failed)?;
+        let chosen = input.as_ref().map(|input| input.uid.clone());
+        *stored = input;
+        // The detector listens on the same microphone the notes record from (S2).
+        if let Some(wake) = &self.wake {
+            wake.set_device(chosen.clone());
+        }
+        Ok(InputChoice { chosen })
     }
 
     pub fn status(&self) -> VoiceStatus {
@@ -60,7 +156,9 @@ impl VoiceInput {
     /// Starting a recording drops the wake word's listener (one capture at a time, S2); once the
     /// recording is over it waits for the phrase again, unless the user turned it off.
     pub fn start(&self, locale: Option<&str>, events: Events) -> Result<(), VoiceError> {
-        let started = self.voice()?.start(locale, events);
+        // The recording reads the choice stored in Rust state, so the panel never passes a device.
+        let chosen = self.chosen();
+        let started = self.voice()?.start(locale, chosen.as_deref(), events);
         self.listen_again();
         started
     }
@@ -142,6 +240,9 @@ struct WakeInner {
     log: PathBuf,
     events: Events,
     enabled: Mutex<bool>,
+    /// The microphone the panel chose (`None` is the system default), so the detector and the
+    /// note it starts listen to the same one (S2).
+    device: Mutex<Option<String>>,
 }
 
 impl Wake {
@@ -155,6 +256,7 @@ impl Wake {
                 log: config.data_dir.join("wake-word.log"),
                 events,
                 enabled: Mutex::new(false),
+                device: Mutex::new(config.voice_input.as_ref().map(|input| input.uid.clone())),
             }),
             detector: cfg!(target_os = "macos").then(|| Arc::new(open_model) as Load),
             chime: wake::platform_chime(),
@@ -189,6 +291,16 @@ impl Wake {
             None => WakeStatus { enabled, available: true, reason: None },
             Some(reason) => WakeStatus { enabled, available: false, reason: Some(reason) },
         }
+    }
+
+    /// The microphone the panel chose, or `None` for the system default.
+    fn device(&self) -> Option<String> {
+        self.inner.device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// Keeps the detector on the same microphone the panel just chose.
+    fn set_device(&self, device: Option<String>) {
+        *self.inner.device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = device;
     }
 
     fn enabled(&self) -> bool {
@@ -273,7 +385,7 @@ impl Wake {
         // Diagnostic wrapper (temporary): the first frame the detector receives goes into the wake
         // log, so a run with no match can tell "no audio arrived" apart from "audio that never
         // scored". `eprintln!` cannot: a bundle launched from the Finder has no visible stderr.
-        let armed = voice.arm(detector, self.listen_events());
+        let armed = voice.arm(self.device().as_deref(), detector, self.listen_events());
         if let Err(error) = &armed {
             self.log("failed", serde_json::json!({ "step": "arm", "reason": error.to_string() }));
         }
@@ -327,7 +439,7 @@ impl Wake {
     fn record(&self) -> Result<(), String> {
         let voice = self.inner.voice.clone().ok_or_else(|| UNSUPPORTED.to_string())?;
         voice
-            .start_woken(None, self.panel_events(), self.listen_events())
+            .start_woken(None, self.device().as_deref(), self.panel_events(), self.listen_events())
             .map_err(|error| error.to_string())?;
         // The panel did not press anything, so a short system pip says the note is running (S3),
         // and it is the only sound: the automatic stop is silent.
@@ -532,6 +644,18 @@ pub async fn voice_cancel(app: AppHandle) -> Result<(), String> {
 }
 
 /// `{enabled, available, reason?}` (S1): whether it is on, and if not, why it cannot be.
+/// `{devices, chosen, default}`: the microphones the panel may choose from (S1-S4).
+#[tauri::command]
+pub async fn voice_input_options(app: AppHandle) -> Result<InputOptions, String> {
+    blocking(app, |input| Ok(input.input_options())).await
+}
+
+/// Stores the chosen microphone (`null` follows the system default) and answers `{chosen}`.
+#[tauri::command]
+pub async fn voice_input_set(app: AppHandle, uid: Option<String>) -> Result<InputChoice, String> {
+    blocking(app, move |input| input.set_input(uid.as_deref())).await
+}
+
 #[tauri::command]
 pub async fn wake_word_status(app: AppHandle) -> Result<WakeStatus, String> {
     blocking(app, |input| Ok(input.wake_status())).await
@@ -661,7 +785,7 @@ mod tests {
     }
 
     fn config(dir: PathBuf) -> DesktopConfig {
-        DesktopConfig { data_dir: dir, port: 0, shortcut: String::new(), wake_word: false }
+        DesktopConfig { data_dir: dir, port: 0, shortcut: String::new(), voice_input: None, wake_word: false }
     }
 
     fn scratch(name: &str) -> PathBuf {

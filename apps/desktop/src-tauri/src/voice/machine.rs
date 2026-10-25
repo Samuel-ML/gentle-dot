@@ -271,7 +271,7 @@ impl Voice {
     /// Waits for the wake word on the microphone's own capture (S2), reporting through `events`.
     /// Only while idle: a recording owns the microphone, and a second listener would open it
     /// twice.
-    pub fn arm(&self, wake: Arc<dyn WakeWord>, events: ListenEvents) -> Result<(), VoiceError> {
+    pub fn arm(&self, device: Option<&str>, wake: Arc<dyn WakeWord>, events: ListenEvents) -> Result<(), VoiceError> {
         let id = self.inner.next_listen.fetch_add(1, Ordering::SeqCst);
         {
             let mut state = lock(&self.inner.state);
@@ -281,7 +281,7 @@ impl Voice {
             }
             *armed = Some(Armed { id, stream: None, wake: wake.clone() });
         }
-        let opened = self.inner.microphone.open(AudioSink::Listener(self.listener(id, wake, events)));
+        let opened = self.inner.microphone.open(device, AudioSink::Listener(self.listener(id, wake, events)));
         let mut state = lock(&self.inner.state);
         match opened {
             Ok(stream) => match &mut *state {
@@ -364,17 +364,17 @@ impl Voice {
     /// Starts recording, prompting for permissions first when they were never asked. Blocks
     /// while a prompt is open, so it runs off the main thread. `events` reach the caller. The
     /// wake word's listener is dropped first: two captures never overlap (S2).
-    pub fn start(&self, requested: Option<&str>, events: Events) -> Result<(), VoiceError> {
-        self.begin(requested, events, None)
+    pub fn start(&self, requested: Option<&str>, device: Option<&str>, events: Events) -> Result<(), VoiceError> {
+        self.begin(requested, device, events, None)
     }
 
     /// Starts the note the wake word asked for (S3): the same path as the panel's button, plus
     /// the automatic stop, which reports through `listen` (S6).
-    pub fn start_woken(&self, requested: Option<&str>, events: Events, listen: ListenEvents) -> Result<(), VoiceError> {
-        self.begin(requested, events, Some(Woken { listen, stop: AutoStop::new() }))
+    pub fn start_woken(&self, requested: Option<&str>, device: Option<&str>, events: Events, listen: ListenEvents) -> Result<(), VoiceError> {
+        self.begin(requested, device, events, Some(Woken { listen, stop: AutoStop::new() }))
     }
 
-    fn begin(&self, requested: Option<&str>, events: Events, woken: Option<Woken>) -> Result<(), VoiceError> {
+    fn begin(&self, requested: Option<&str>, device: Option<&str>, events: Events, woken: Option<Woken>) -> Result<(), VoiceError> {
         self.disarm();
         let (recording, previous) = {
             let mut state = lock(&self.inner.state);
@@ -393,7 +393,7 @@ impl Voice {
         let sink = Sink { inner: Arc::downgrade(&self.inner), recording };
         let begun = self.prepare(requested, recording).and_then(|locale| {
             let mut recognition = self.inner.recognizer.begin(&locale, sink.clone())?;
-            match self.inner.microphone.open(AudioSink::Recording(sink)) {
+            match self.inner.microphone.open(device, AudioSink::Recording(sink)) {
                 Ok(stream) => Ok((stream, recognition)),
                 Err(error) => {
                     recognition.cancel();
@@ -675,11 +675,11 @@ mod tests {
 
     impl Rig {
         fn start(&self) -> Result<(), VoiceError> {
-            self.voice.start(None, self.recorder.events())
+            self.voice.start(None, None, self.recorder.events())
         }
 
         fn listen(&self, wake: &Arc<FakeWake>) -> Result<(), VoiceError> {
-            self.voice.arm(wake.clone(), self.listenings.events())
+            self.voice.arm(None, wake.clone(), self.listenings.events())
         }
 
         /// Feeds the microphone's tap: 10 ms chunks of a constant level, so rms == `level`.
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn the_requested_locale_reaches_the_recognizer() {
         let rig = granted();
-        rig.voice.start(Some("es_AR"), rig.recorder.events()).unwrap();
+        rig.voice.start(Some("es_AR"), None, rig.recorder.events()).unwrap();
         assert_eq!(rig.recognizer.log.lock().unwrap().locales, vec!["es-ES".to_string()]);
     }
 
@@ -963,7 +963,7 @@ mod tests {
         let mic = rig.mic.clone();
         *mic.open_error.lock().unwrap() = None;
         let voice = Voice::new(Arc::new(FailingOnOpen(mic, recognizer.clone())), recognizer.clone(), rig.clock.clone());
-        assert_eq!(voice.start(None, rig.recorder.events()), Err(VoiceError::Failed("Siri and Dictation are disabled.".into())));
+        assert_eq!(voice.start(None, None, rig.recorder.events()), Err(VoiceError::Failed("Siri and Dictation are disabled.".into())));
         assert_eq!(recognizer.log.lock().unwrap().cancelled, 1);
         assert_eq!(voice.stop(), Err(VoiceError::NotRecording));
     }
@@ -980,9 +980,9 @@ mod tests {
             self.0.request_authorization()
         }
 
-        fn open(&self, sink: crate::voice::AudioSink) -> Result<Box<dyn crate::voice::Stream>, VoiceError> {
+        fn open(&self, device: Option<&str>, sink: crate::voice::AudioSink) -> Result<Box<dyn crate::voice::Stream>, VoiceError> {
             self.1.sink().failed("Siri and Dictation are disabled.");
-            self.0.open(sink)
+            self.0.open(device, sink)
         }
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn a_woken_note_is_not_cut_before_a_second_of_speech() {
         let rig = granted();
-        rig.voice.start_woken(None, rig.recorder.events(), rig.listenings.events()).unwrap();
+        rig.voice.start_woken(None, None, rig.recorder.events(), rig.listenings.events()).unwrap();
         rig.feed(SPEECH, 900);
         rig.feed(0.0, 5_000);
         assert!(rig.listenings.settle().is_empty(), "a pause right after the phrase cannot cut the note");
@@ -1067,7 +1067,7 @@ mod tests {
     #[test]
     fn a_woken_note_is_cut_after_silence_that_follows_speech() {
         let rig = granted();
-        rig.voice.start_woken(None, rig.recorder.events(), rig.listenings.events()).unwrap();
+        rig.voice.start_woken(None, None, rig.recorder.events(), rig.listenings.events()).unwrap();
         rig.feed(SPEECH, 1_000);
         rig.feed(0.0, 1_490);
         assert!(rig.listenings.settle().is_empty(), "the cut waits for a second and a half of silence");
@@ -1080,7 +1080,7 @@ mod tests {
     #[test]
     fn a_noisy_room_does_not_count_as_speech_and_the_note_still_ends() {
         let rig = granted();
-        rig.voice.start_woken(None, rig.recorder.events(), rig.listenings.events()).unwrap();
+        rig.voice.start_woken(None, None, rig.recorder.events(), rig.listenings.events()).unwrap();
         // A fan or a keyboard louder than the old fixed threshold: speech has to stand above the
         // room, so none of this is a word.
         rig.feed(0.02, 3_900);
@@ -1092,7 +1092,7 @@ mod tests {
     #[test]
     fn background_noise_after_speech_lets_the_silence_run() {
         let rig = granted();
-        rig.voice.start_woken(None, rig.recorder.events(), rig.listenings.events()).unwrap();
+        rig.voice.start_woken(None, None, rig.recorder.events(), rig.listenings.events()).unwrap();
         rig.feed(SPEECH, 1_000);
         // Louder than the old threshold, quiet for this room's scale: the cut must not wait for it.
         rig.feed(0.02, 1_400);
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn a_woken_note_still_stops_at_the_hard_cap() {
         let rig = granted();
-        rig.voice.start_woken(None, rig.recorder.events(), rig.listenings.events()).unwrap();
+        rig.voice.start_woken(None, None, rig.recorder.events(), rig.listenings.events()).unwrap();
         // Speech without a pause: nothing but the cap ends this note.
         rig.feed(SPEECH, MAX_RECORDING_MS + 100);
         assert_eq!(rig.listenings.wait_for(1), vec![ListenEvent::Silent]);

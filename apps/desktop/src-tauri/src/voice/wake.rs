@@ -261,16 +261,13 @@ impl ParakeetWake {
             let _busy = Decoding(shared.clone());
             let heard = shared.engine.transcribe(&window);
             note(&shared.log, heard.as_deref().unwrap_or(""));
-            match heard {
-                Ok(text) => {
-                    // Silence, other words, or a decode that failed: the next window asks again, so a
-                    // failed decode costs one window and not the listener.
-                    if let Some(variant) = says_wake_word(&text) {
-                        *lock(&shared.pending) =
-                            Some(Detection { name: WAKE_WORD.to_string(), score: 1.0, variant: Some(variant) });
-                    }
+            // Silence, other words, or a decode that failed: the next window asks again, so a
+            // failed decode costs one window and not the listener.
+            if let Ok(text) = heard {
+                if let Some(variant) = says_wake_word(&text) {
+                    *lock(&shared.pending) =
+                        Some(Detection { name: WAKE_WORD.to_string(), score: 1.0, variant: Some(variant) });
                 }
-                Err(_) => {}
             }
         });
         if spawned.is_err() {
