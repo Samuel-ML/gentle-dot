@@ -717,7 +717,15 @@ impl Wake {
         }
         // The note's capture is closed here; the detector takes the microphone back next (S4).
         self.log("note_stopped", serde_json::json!({}));
-        self.resume();
+        // The supervisor owns the microphone: arming from here while the machine is still closing
+        // the note answered Busy and started a retry ladder of failed arms (the log's
+        // "Voice input is already recording"). It recovers on its next tick instead.
+        let busy = self.inner.voice.as_ref().is_some_and(|voice| voice.busy());
+        if busy {
+            self.log("resume_deferred", serde_json::json!({ "because": "the machine is still closing the note" }));
+        } else {
+            self.resume();
+        }
         self.announce();
     }
 
