@@ -733,6 +733,9 @@ impl Wake {
     /// never left silent (S1). One guard runs per open capture; a recovery starts the next one.
     fn guard_capture(&self) {
         let delegate = self.clone();
+        // Frames this capture must beat to count as alive: the clock alone cannot tell a fresh
+        // capture from a dead one, and resetting the attempts on a young clock looped forever.
+        let baseline = self.inner.voice.as_ref().map_or(0, |voice| voice.frames_seen());
         let spawned = std::thread::Builder::new().name("wake-capture".into()).spawn(move || loop {
             let tick = delegate.inner.guard_tick_ms.load(Ordering::SeqCst);
             let tolerance = delegate.inner.guard_silent_ms.load(Ordering::SeqCst);
@@ -747,9 +750,13 @@ impl Wake {
             }
             let last = voice.last_frame_ms();
             let age = now_ms().saturating_sub(last);
-            if last != 0 && age < tolerance {
-                // Frames are arriving, so this capture is healthy: the next loss starts over.
+            if voice.frames_seen() > baseline {
+                // This capture delivered audio, so it is healthy: the next loss starts over.
                 delegate.inner.silent_attempts.store(0, Ordering::SeqCst);
+                continue;
+            }
+            if age < tolerance {
+                // Nothing yet, but a capture gets its whole tolerance to speak up.
                 continue;
             }
             let attempt = delegate.inner.silent_attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -757,6 +764,13 @@ impl Wake {
                 "capture_lost",
                 serde_json::json!({ "silent_ms": age, "attempt": attempt, "device": delegate.device() }),
             );
+            // Already on the default input and still nothing: cycling the microphone every tick only
+            // makes it blink. Stop here; the next arm (a note ending, the switch, a restart) starts
+            // a fresh guard with a fresh clock.
+            if delegate.inner.force_default.load(Ordering::SeqCst) {
+                delegate.log("capture_gave_up", serde_json::json!({ "attempts": attempt }));
+                return;
+            }
             if attempt > CAPTURE_RETRIES && !delegate.inner.force_default.swap(true, Ordering::SeqCst) {
                 delegate.log(
                     "device_fallback",
@@ -1382,6 +1396,8 @@ mod tests {
         rig.wake.set_capture_guard(Duration::from_millis(5), Duration::from_millis(20));
         rig.wake.set(true).unwrap();
         // No audio is ever fed to the detector: every capture looks dead.
+        std::thread::sleep(Duration::from_millis(300));
+        eprintln!("LOG>>> {}", std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap_or_default());
         wait_until("the channel is recovered", || {
             let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap_or_default();
             (1..=3).all(|attempt| log.contains(&format!("\"attempt\":{attempt}")))
@@ -1393,6 +1409,23 @@ mod tests {
         assert!(log.contains("\"capture_lost\""), "{log}");
         assert!(rig.mic.log.lock().unwrap().opened >= 4, "three retries, then the fallback");
         assert!(rig.wake.status().enabled, "the switch never turns itself off");
+    }
+
+    #[test]
+    fn a_channel_that_never_delivers_stops_toggling_the_microphone() {
+        // The blink the user saw: every tick reopened the capture, so the microphone lit and died
+        // in a loop. Once the default input is in use and nothing arrives, the guard stops and the
+        // next arm starts over instead of fighting the device forever.
+        let rig = wake_rig("blink", true);
+        rig.wake.set_capture_guard(Duration::from_millis(5), Duration::from_millis(20));
+        rig.wake.set(true).unwrap();
+        wait_until("the guard gives up", || {
+            std::fs::read_to_string(rig.dir.join("wake-word.log")).is_ok_and(|log| log.contains("capture_gave_up"))
+        });
+        let opened = rig.mic.log.lock().unwrap().opened;
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(rig.mic.log.lock().unwrap().opened, opened, "the microphone is not toggled any more");
+        assert_eq!(rig.mic.log.lock().unwrap().overlap, 0);
     }
 
     #[test]

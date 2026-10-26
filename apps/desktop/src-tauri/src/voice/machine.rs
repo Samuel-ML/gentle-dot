@@ -77,6 +77,9 @@ struct Inner {
     /// nothing (a Bluetooth headset that slept, a device that went away), and that is invisible
     /// without this: the detector looks armed and hears nothing (S1).
     last_frame_ms: AtomicU64,
+    /// How many frames the detector has received in total: a capture that opened must raise this
+    /// to count as alive, whatever the clock says.
+    frames_seen: AtomicU64,
 }
 
 enum State {
@@ -280,6 +283,7 @@ impl Voice {
             changed: Condvar::new(),
             next_listen: AtomicU64::new(0),
             last_frame_ms: AtomicU64::new(0),
+            frames_seen: AtomicU64::new(0),
         };
         Voice { inner: Arc::new(inner), final_timeout: FINAL_TIMEOUT }
     }
@@ -303,6 +307,9 @@ impl Voice {
             Ok(stream) => match &mut *state {
                 State::Idle { armed: Some(armed), .. } if armed.id == id => {
                     armed.stream = Some(stream);
+                    // A fresh capture gets its whole tolerance to deliver a first frame; without
+                    // this the last frame of the previous capture makes it look dead at once.
+                    self.inner.last_frame_ms.store(millis(), Ordering::SeqCst);
                     Ok(())
                 }
                 // Disarmed or taken over while the capture was opening: the recording keeps the
@@ -371,6 +378,7 @@ impl Voice {
                 return;
             }
             inner.last_frame_ms.store(millis(), Ordering::SeqCst);
+            inner.frames_seen.fetch_add(1, Ordering::SeqCst);
             let Some(detection) = wake.accept(samples) else { return };
             if !armed(&inner, id) {
                 return;
@@ -388,6 +396,12 @@ impl Voice {
 
     /// When the detector last received audio, in milliseconds since the epoch: `0` means the
     /// capture is open but nothing ever arrived (S1).
+    /// How many frames the detector has received since the app started: the guard compares it with
+    /// the value at arm time to know whether this capture ever delivered anything.
+    pub fn frames_seen(&self) -> u64 {
+        self.inner.frames_seen.load(Ordering::SeqCst)
+    }
+
     pub fn last_frame_ms(&self) -> u64 {
         self.inner.last_frame_ms.load(Ordering::SeqCst)
     }
