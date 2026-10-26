@@ -63,6 +63,7 @@ pub const STARTED_EVENT: &str = "voice://started";
 /// The transcript of a recording the user did not stop himself, which is the note the wake word
 /// started (S3): `{text}`, the same shape as the `voice_stop` reply, so the panel sends it the
 /// same way it sends one it stopped.
+pub const STATE_EVENT: &str = "voice://state";
 pub const TRANSCRIPT_EVENT: &str = "voice://transcript";
 pub const UNSUPPORTED: &str = "Voice input is available on macOS and Linux.";
 
@@ -100,6 +101,9 @@ pub enum VoiceEvent {
     Started,
     /// A transcript nobody asked for on the spot: the wake word's automatic stop (S3).
     Transcript(String),
+    /// The whole state of voice input, so the panel mirrors it instead of keeping its own truth
+    /// (T7): `{wake:{enabled,available,reason?,phrase}, capture:{phase}}`.
+    State(serde_json::Value),
 }
 
 impl VoiceEvent {
@@ -110,6 +114,7 @@ impl VoiceEvent {
             VoiceEvent::Error(_) => ERROR_EVENT,
             VoiceEvent::Started => STARTED_EVENT,
             VoiceEvent::Transcript(_) => TRANSCRIPT_EVENT,
+            VoiceEvent::State(_) => STATE_EVENT,
         }
     }
 
@@ -120,6 +125,7 @@ impl VoiceEvent {
             VoiceEvent::Error(message) => serde_json::json!({ "message": message }),
             VoiceEvent::Started => serde_json::json!({}),
             VoiceEvent::Transcript(text) => serde_json::json!({ "text": text }),
+            VoiceEvent::State(state) => state.clone(),
         }
     }
 }

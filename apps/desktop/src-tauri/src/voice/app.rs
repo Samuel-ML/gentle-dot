@@ -400,6 +400,7 @@ impl Wake {
             self.disarm();
             self.resume();
         }
+        self.announce();
         Ok(self.status())
     }
 
@@ -691,6 +692,7 @@ impl Wake {
         self.inner.note_ms.store(now_ms(), Ordering::SeqCst);
         self.inner.frames_at_note.store(voice.frames_seen(), Ordering::SeqCst);
         self.inner.notes.fetch_add(1, Ordering::SeqCst);
+        self.announce();
         Ok(())
     }
 
@@ -716,6 +718,23 @@ impl Wake {
         // The note's capture is closed here; the detector takes the microphone back next (S4).
         self.log("note_stopped", serde_json::json!({}));
         self.resume();
+        self.announce();
+    }
+
+    /// Publishes the one truth the panel mirrors: whether the detector is on, what it is listening
+    /// for, and what the capture is doing. Called on every transition that changes any of them (T7).
+    fn announce(&self) {
+        let status = self.status();
+        let phase = match &self.inner.voice {
+            Some(voice) if voice.busy() => "recording",
+            Some(voice) if voice.listening() => "listening",
+            _ => "idle",
+        };
+        let state = serde_json::json!({
+            "wake": status,
+            "capture": { "phase": phase, "device": self.device() },
+        });
+        (self.inner.events)(VoiceEvent::State(state));
     }
 
     /// The microphone's only owner: one thread for the app's whole life decides whether the channel

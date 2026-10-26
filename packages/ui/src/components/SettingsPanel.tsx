@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	formatShortcut,
@@ -130,8 +131,24 @@ export function SettingsPanel({ close }: { close: () => void }) {
 			setWake(found);
 			setPhrase(found.phrase ?? "");
 		});
+		// The backend's own state, pushed on every change: the switch shows what is true, not what
+		// it last asked for.
+		let stopListening: (() => void) | undefined;
+		void listen<{ wake?: Partial<WakeWord> }>("voice://state", (event) => {
+			const pushed = event.payload?.wake;
+			if (!live || !pushed) return;
+			setWake((previous) => ({
+				enabled: pushed.enabled === true,
+				available: pushed.available !== false,
+				reason: typeof pushed.reason === "string" ? pushed.reason : undefined,
+				phrase: typeof pushed.phrase === "string" ? pushed.phrase : previous?.phrase,
+			}));
+		}).then((stop) => {
+			stopListening = stop;
+		});
 		return () => {
 			live = false;
+			stopListening?.();
 		};
 	}, []);
 

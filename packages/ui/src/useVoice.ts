@@ -371,6 +371,12 @@ export function useVoice(state: DotState, send: Send): VoiceControls {
 				if (phaseNow.current === "idle") setPhase("recording");
 			},
 			transcript: (text) => sendTranscript(text),
+			// The backend owns the state; the panel only follows it. A recording phase the backend
+			// no longer reports is over, whatever the panel believed.
+			state: (state) => {
+				const phase = state.capture?.phase;
+				if (typeof phase === "string" && phase !== "recording" && phaseNow.current === "recording") finish();
+			},
 		}).catch(() => () => {});
 		return () => {
 			live = false;

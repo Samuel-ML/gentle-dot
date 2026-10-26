@@ -52,6 +52,14 @@ export interface NativeVoiceHandlers {
 	started?: () => void;
 	/** The transcript of a note the wake word ended by itself (S30.7). */
 	transcript?: (text: string) => void;
+	/** The backend's own truth about voice input: the panel mirrors it instead of keeping its own. */
+	state?: (state: VoiceState) => void;
+}
+
+/** What `voice://state` carries: the wake word's switch and what the capture is doing. */
+export interface VoiceState {
+	wake?: { enabled?: unknown; available?: unknown; reason?: unknown; phrase?: unknown };
+	capture?: { phase?: unknown; device?: unknown };
 }
 
 /** Listens to the recognizer's events; resolves with a function that stops listening. */
@@ -74,6 +82,7 @@ export async function onNativeVoice(handlers: NativeVoiceHandlers): Promise<() =
 		listen<{ text?: unknown }>("voice://transcript", (event) => {
 			if (typeof event.payload?.text === "string") handlers.transcript?.(event.payload.text);
 		}),
+		listen<VoiceState>("voice://state", (event) => handlers.state?.(event.payload ?? {})),
 	]);
 	return () => {
 		for (const stop of stops) stop();
