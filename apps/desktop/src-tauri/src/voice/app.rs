@@ -17,7 +17,7 @@ use crate::computer::SystemClock;
 use crate::config::DesktopConfig;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How long each retry waits before trying the microphone again: a second, then doubling.
@@ -32,6 +32,14 @@ const NOTE_DEADLINE_MS: u64 = 65_000;
 /// How long a note may spend starting before it is treated as stalled (S1, S4): a Bluetooth input
 /// whose engine never delivers leaves the machine in `Starting` and the detector paused.
 const STALL_MS: u64 = 3_000;
+
+/// The listen channel is watched on its own clock: a capture that opened and delivers nothing is a
+/// lost channel whatever the engine reported (screenpipe's `Ok` only means "no error, not
+/// capturing"), so it is reopened with backoff and, after the retries, on the system default input
+/// rather than left silent.
+const CAPTURE_TICK_MS: u64 = 2_000;
+const CAPTURE_SILENT_MS: u64 = 8_000;
+const CAPTURE_RETRIES: usize = 3;
 
 
 /// The commands, as registered in `build.rs` and granted to the panel.
@@ -287,6 +295,15 @@ struct WakeInner {
     deadline_ms: std::sync::atomic::AtomicU64,
     /// Counts the notes the detector started, so a deadline only ends the note it was started for.
     notes: AtomicU64,
+    /// The listen channel's own clock: how often it is checked, and how long a capture may stay
+    /// open without a frame before it counts as lost (S1).
+    guard_tick_ms: std::sync::atomic::AtomicU64,
+    guard_silent_ms: std::sync::atomic::AtomicU64,
+    /// How many recoveries in a row the current capture needed; a single frame resets it.
+    silent_attempts: AtomicUsize,
+    /// Set when the chosen input never delivers and the system default is used instead, for this
+    /// session only: the stored choice is never overwritten (S1).
+    force_default: AtomicBool,
     /// What the detector listens for; the panel may change it (S30.7).
     phrase: Mutex<wake::Phrase>,
     /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
@@ -305,6 +322,10 @@ impl Wake {
                 events,
                 enabled: Mutex::new(false),
                 device: Mutex::new(config.voice_input.as_ref().map(|input| input.uid.clone())),
+                guard_tick_ms: std::sync::atomic::AtomicU64::new(CAPTURE_TICK_MS),
+                guard_silent_ms: std::sync::atomic::AtomicU64::new(CAPTURE_SILENT_MS),
+                silent_attempts: AtomicUsize::new(0),
+                force_default: std::sync::atomic::AtomicBool::new(false),
                 deadline_ms: std::sync::atomic::AtomicU64::new(NOTE_DEADLINE_MS),
                 notes: AtomicU64::new(0),
                 phrase: Mutex::new(wake::Phrase::typed(&config.wake_phrase)),
@@ -394,6 +415,10 @@ impl Wake {
 
     /// The microphone the panel chose, or `None` for the system default.
     fn device(&self) -> Option<String> {
+        if self.inner.force_default.load(Ordering::SeqCst) {
+            // The chosen input never delivered a frame; the default keeps the channel alive.
+            return None;
+        }
         self.inner.device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
@@ -445,7 +470,13 @@ impl Wake {
                 return Err(reason);
             }
             let voice = self.inner.voice.clone().ok_or_else(|| UNSUPPORTED.to_string())?;
-            self.listen(&voice).map_err(|error| error.to_string())?;
+            // The switch says on before the channel opens: the guard that watches that channel
+            // starts with the arm and must not see the previous state.
+            self.set_enabled(true);
+            if let Err(error) = self.listen(&voice) {
+                self.set_enabled(false);
+                return Err(error.to_string());
+            }
         } else {
             self.disarm();
         }
@@ -491,6 +522,10 @@ impl Wake {
         // log, so a run with no match can tell "no audio arrived" apart from "audio that never
         // scored". `eprintln!` cannot: a bundle launched from the Finder has no visible stderr.
         let armed = voice.arm(self.device().as_deref(), detector, self.listen_events());
+        if armed.is_ok() {
+            // The channel that just opened is watched from its first tick (S1).
+            self.guard_capture();
+        }
         if let Err(error) = &armed {
             self.log("failed", serde_json::json!({ "step": "arm", "reason": error.to_string() }));
         }
@@ -677,6 +712,59 @@ impl Wake {
         if spawned.is_err() {
             self.log("failed", serde_json::json!({ "reason": "the note's deadline could not start" }));
         }
+    }
+
+    /// Watches the listen channel: a capture that has no fresh frame is reopened with backoff, and
+    /// after `CAPTURE_RETRIES` recoveries the system default input takes over, so the channel is
+    /// never left silent (S1). One guard runs per open capture; a recovery starts the next one.
+    fn guard_capture(&self) {
+        let delegate = self.clone();
+        let spawned = std::thread::Builder::new().name("wake-capture".into()).spawn(move || loop {
+            let tick = delegate.inner.guard_tick_ms.load(Ordering::SeqCst);
+            let tolerance = delegate.inner.guard_silent_ms.load(Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(tick.min(tolerance / 2).max(5)));
+            if !delegate.enabled() {
+                return;
+            }
+            let Some(voice) = delegate.inner.voice.clone() else { return };
+            if !voice.listening() {
+                // A note owns the microphone; its own end arms the detector and starts a new guard.
+                return;
+            }
+            let last = voice.last_frame_ms();
+            let age = now_ms().saturating_sub(last);
+            if last != 0 && age < tolerance {
+                // Frames are arriving, so this capture is healthy: the next loss starts over.
+                delegate.inner.silent_attempts.store(0, Ordering::SeqCst);
+                continue;
+            }
+            let attempt = delegate.inner.silent_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            delegate.log(
+                "capture_lost",
+                serde_json::json!({ "silent_ms": age, "attempt": attempt, "device": delegate.device() }),
+            );
+            if attempt > CAPTURE_RETRIES && !delegate.inner.force_default.swap(true, Ordering::SeqCst) {
+                delegate.log(
+                    "device_fallback",
+                    serde_json::json!({ "after_attempts": CAPTURE_RETRIES, "to": "the system default input" }),
+                );
+            }
+            // A recovery that keeps failing waits longer each time instead of spinning.
+            let backoff = 250_u64 << attempt.min(4).saturating_sub(1);
+            std::thread::sleep(std::time::Duration::from_millis(backoff));
+            delegate.disarm();
+            delegate.resume();
+            return;
+        });
+        if spawned.is_err() {
+            self.log("failed", serde_json::json!({ "reason": "the listen channel's guard could not start" }));
+        }
+    }
+
+    /// The guard's clock, shortened so a test does not wait seconds for it (S1).
+    pub fn set_capture_guard(&self, tick: std::time::Duration, tolerance: std::time::Duration) {
+        self.inner.guard_tick_ms.store(tick.as_millis() as u64, Ordering::SeqCst);
+        self.inner.guard_silent_ms.store(tolerance.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// The deadline, shortened so a test does not wait a minute for it (S4).
@@ -1242,6 +1330,28 @@ mod tests {
         let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
         assert!(log.contains("\"note_deadline\""), "{log}");
         assert!(log.contains("\"note_stopped\""), "{log}");
+    }
+
+    #[test]
+    fn a_capture_that_delivers_nothing_is_reopened_three_times_and_then_falls_back() {
+        // "Always keep the listen channel": a capture that opened and never delivers a frame is
+        // reopened with backoff, and after three recoveries the system default input takes over,
+        // which is what screenpipe and Handy do around their own capture layer (S1).
+        let rig = wake_rig("channel", true);
+        rig.wake.set_capture_guard(Duration::from_millis(5), Duration::from_millis(20));
+        rig.wake.set(true).unwrap();
+        // No audio is ever fed to the detector: every capture looks dead.
+        wait_until("the channel is recovered", || {
+            let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap_or_default();
+            (1..=3).all(|attempt| log.contains(&format!("\"attempt\":{attempt}")))
+        });
+        wait_until("the default input takes over", || {
+            std::fs::read_to_string(rig.dir.join("wake-word.log")).is_ok_and(|log| log.contains("\"device_fallback\""))
+        });
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        assert!(log.contains("\"capture_lost\""), "{log}");
+        assert!(rig.mic.log.lock().unwrap().opened >= 4, "three retries, then the fallback");
+        assert!(rig.wake.status().enabled, "the switch never turns itself off");
     }
 
     #[test]
