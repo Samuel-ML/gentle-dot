@@ -312,6 +312,15 @@ struct WakeInner {
     force_default: AtomicBool,
     /// Set when the built-in microphone had to take over because nothing else delivered audio.
     use_built_in: AtomicBool,
+    /// When the capture currently armed opened, and how many frames the app had seen then: the
+    /// supervisor's only measure of "this capture is alive".
+    armed_ms: AtomicU64,
+    frames_at_arm: AtomicU64,
+    /// The same for the note that is running, when one is.
+    note_ms: AtomicU64,
+    frames_at_note: AtomicU64,
+    /// One supervisor per app, not one per arm: the microphone has a single owner.
+    supervising: AtomicBool,
     /// What the detector listens for; the panel may change it (S30.7).
     phrase: Mutex<wake::Phrase>,
     /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
@@ -335,6 +344,11 @@ impl Wake {
                 silent_attempts: AtomicUsize::new(0),
                 force_default: std::sync::atomic::AtomicBool::new(false),
                 use_built_in: AtomicBool::new(false),
+                armed_ms: AtomicU64::new(0),
+                frames_at_arm: AtomicU64::new(0),
+                note_ms: AtomicU64::new(0),
+                frames_at_note: AtomicU64::new(0),
+                supervising: AtomicBool::new(false),
                 deadline_ms: std::sync::atomic::AtomicU64::new(NOTE_DEADLINE_MS),
                 notes: AtomicU64::new(0),
                 phrase: Mutex::new(wake::Phrase::typed(&config.wake_phrase)),
@@ -501,14 +515,19 @@ impl Wake {
                 return Err(error.to_string());
             }
         } else {
+            self.set_enabled(false);
             self.disarm();
         }
         if let Err(error) = crate::config::save_wake_word(&self.inner.config_file, enabled) {
-            // The arm already happened, so the microphone is open: say why the flag did not stick.
+            // The flag lives in memory and on disk; when the write fails the two disagree unless one
+            // is undone. The microphone keeps the state the switch shows (T7).
             self.log("failed", serde_json::json!({ "step": "save", "enabled": enabled, "reason": error }));
+            if enabled {
+                self.set_enabled(false);
+                self.disarm();
+            }
             return Err(error);
         }
-        self.set_enabled(enabled);
         Ok(self.status())
     }
 
@@ -559,8 +578,10 @@ impl Wake {
             }
         };
         if armed.is_ok() {
-            // The channel that just opened is watched from its first tick (S1).
-            self.guard_capture();
+            // The capture's own clock, and the frame count it has to beat (S1).
+            self.inner.armed_ms.store(now_ms(), Ordering::SeqCst);
+            self.inner.frames_at_arm.store(voice.frames_seen(), Ordering::SeqCst);
+            self.supervise();
         }
         armed
     }
@@ -666,10 +687,10 @@ impl Wake {
         // The panel did not press anything, so it needs to know a note is running (S3).
         (self.inner.events)(VoiceEvent::Started);
         self.log("note_started", serde_json::json!({}));
-        // A note that hears nothing never reaches the auto-stop; this ends it anyway (S4).
-        let mine = self.inner.notes.fetch_add(1, Ordering::SeqCst) + 1;
-        self.end_after_stall(mine);
-        self.end_after_deadline(mine);
+        // The supervisor owns the note's timeouts now: it is the one watching the microphone (S4).
+        self.inner.note_ms.store(now_ms(), Ordering::SeqCst);
+        self.inner.frames_at_note.store(voice.frames_seen(), Ordering::SeqCst);
+        self.inner.notes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -697,142 +718,110 @@ impl Wake {
         self.resume();
     }
 
-    /// Ends a start that never became a recording, which is what a sleeping headset looks like:
-    /// the capture opens, the engine never delivers, and the detector stays paused (S1, S4).
-    fn end_after_stall(&self, mine: u64) {
-        let delegate = self.clone();
-        let spawned = std::thread::Builder::new().name("wake-stall".into()).spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(STALL_MS));
-            if delegate.inner.notes.load(Ordering::SeqCst) != mine {
-                return;
-            }
-            let Some(voice) = delegate.inner.voice.clone() else { return };
-            if !voice.starting() {
-                delegate.log("note_stall_skipped", serde_json::json!({ "because": "the note started" }));
-                return;
-            }
-            delegate.log("note_stalled", serde_json::json!({ "after_ms": STALL_MS }));
-            delegate.log("note_stopped", serde_json::json!({ "from": "stalled" }));
-            if let Err(error) = voice.cancel() {
-                delegate.log("failed", serde_json::json!({ "reason": error.to_string() }));
-            }
-            delegate.resume();
-        });
-        if spawned.is_err() {
-            self.log("failed", serde_json::json!({ "reason": "the note's stall check could not start" }));
-        }
-    }
-
-    /// Ends the note `mine` if it is still the one running when the deadline passes.
-    fn end_after_deadline(&self, mine: u64) {
-        let delegate = self.clone();
-        let wait = std::time::Duration::from_millis(self.inner.deadline_ms.load(Ordering::SeqCst));
-        let spawned = std::thread::Builder::new().name("wake-deadline".into()).spawn(move || {
-            std::thread::sleep(wait);
-            let now = delegate.inner.notes.load(Ordering::SeqCst);
-            if now != mine {
-                delegate.log("note_deadline_skipped", serde_json::json!({ "because": "another note started", "note": mine, "current": now }));
-                return;
-            }
-            let Some(voice) = delegate.inner.voice.clone() else {
-                delegate.log("note_deadline_skipped", serde_json::json!({ "because": "no voice backend" }));
-                return;
-            };
-            if !voice.busy() {
-                delegate.log("note_deadline_skipped", serde_json::json!({ "because": "the note already ended" }));
-                return;
-            }
-            // A start that never became a recording is the Bluetooth stall: nothing was captured,
-            // so it is cancelled instead of stopped, and the detector takes the microphone back.
-            if voice.starting() {
-                delegate.log("note_stalled", serde_json::json!({ "after_ms": wait.as_millis() as u64 }));
-                delegate.log("note_stopped", serde_json::json!({ "from": "stalled" }));
-                if let Err(error) = voice.cancel() {
-                    delegate.log("failed", serde_json::json!({ "reason": error.to_string() }));
-                }
-                delegate.resume();
-                return;
-            }
-            delegate.log("note_deadline", serde_json::json!({ "after_ms": wait.as_millis() as u64 }));
-            delegate.stop();
-        });
-        if spawned.is_err() {
-            self.log("failed", serde_json::json!({ "reason": "the note's deadline could not start" }));
-        }
-    }
-
-    /// Watches the listen channel: a capture that has no fresh frame is reopened with backoff, and
-    /// after `CAPTURE_RETRIES` recoveries the system default input takes over, so the channel is
-    /// never left silent (S1). One guard runs per open capture; a recovery starts the next one.
-    fn guard_capture(&self) {
-        let delegate = self.clone();
-        // Frames this capture must beat to count as alive: the clock alone cannot tell a fresh
-        // capture from a dead one, and resetting the attempts on a young clock looped forever.
-        let baseline = self.inner.voice.as_ref().map_or(0, |voice| voice.frames_seen());
-        let spawned = std::thread::Builder::new().name("wake-capture".into()).spawn(move || loop {
-            let tick = delegate.inner.guard_tick_ms.load(Ordering::SeqCst);
-            let tolerance = delegate.inner.guard_silent_ms.load(Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(tick.min(tolerance / 2).max(5)));
-            if !delegate.enabled() {
-                return;
-            }
-            let Some(voice) = delegate.inner.voice.clone() else { return };
-            if !voice.listening() {
-                // A note owns the microphone; its own end arms the detector and starts a new guard.
-                return;
-            }
-            let last = voice.last_frame_ms();
-            let age = now_ms().saturating_sub(last);
-            if voice.frames_seen() > baseline {
-                // This capture delivered audio, so it is healthy: the next loss starts over.
-                delegate.inner.silent_attempts.store(0, Ordering::SeqCst);
-                continue;
-            }
-            if age < tolerance {
-                // Nothing yet, but a capture gets its whole tolerance to speak up.
-                continue;
-            }
-            let attempt = delegate.inner.silent_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            delegate.log(
-                "capture_lost",
-                serde_json::json!({ "silent_ms": age, "attempt": attempt, "device": delegate.device() }),
-            );
-            // Already on the default input and still nothing: cycling the microphone every tick only
-            // makes it blink. Stop here; the next arm (a note ending, the switch, a restart) starts
-            // a fresh guard with a fresh clock.
-            if delegate.inner.force_default.load(Ordering::SeqCst) {
-                // The default is mute too. The built-in is the last input left, and it is tried once
-                // before giving up: a sleeping headset must not leave the wake word dead.
-                if delegate.fall_back_to_built_in("no frames on the default input") {
-                    delegate.disarm();
-                    delegate.resume();
-                    return;
-                }
-                delegate.log("capture_gave_up", serde_json::json!({ "attempts": attempt }));
-                return;
-            }
-            if attempt > CAPTURE_RETRIES && !delegate.inner.force_default.swap(true, Ordering::SeqCst) {
-                delegate.log(
-                    "device_fallback",
-                    serde_json::json!({ "after_attempts": CAPTURE_RETRIES, "to": "the system default input" }),
-                );
-            }
-            // A recovery that keeps failing waits longer each time instead of spinning.
-            let backoff = 250_u64 << attempt.min(4).saturating_sub(1);
-            std::thread::sleep(std::time::Duration::from_millis(backoff));
-            delegate.disarm();
-            delegate.resume();
+    /// The microphone's only owner: one thread for the app's whole life decides whether the channel
+    /// is listening, recovering, or watching a note. Every other actor used to open and close the
+    /// device on its own, and their orders contradicted (T5).
+    fn supervise(&self) {
+        if self.inner.supervising.swap(true, Ordering::SeqCst) {
             return;
+        }
+        let delegate = self.clone();
+        let spawned = std::thread::Builder::new().name("wake-supervisor".into()).spawn(move || loop {
+            let tick = delegate.inner.guard_tick_ms.load(Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(tick.max(20)));
+            if !delegate.enabled() {
+                continue;
+            }
+            let Some(voice) = delegate.inner.voice.clone() else { continue };
+            if voice.busy() {
+                delegate.watch_note(&voice);
+            } else if voice.listening() {
+                delegate.watch_capture(&voice);
+            } else {
+                // Nothing owns the microphone and nothing is listening: this is the one place that
+                // brings the channel back, whatever the previous actor left behind (S1).
+                delegate.log("channel_recovered", serde_json::json!({ "because": "nothing was open" }));
+                delegate.recover();
+            }
         });
         if spawned.is_err() {
-            self.log("failed", serde_json::json!({ "reason": "the listen channel's guard could not start" }));
+            self.inner.supervising.store(false, Ordering::SeqCst);
+            self.log("failed", serde_json::json!({ "reason": "the supervisor could not start" }));
         }
     }
 
-    /// The guard's clock, shortened so a test does not wait seconds for it (S1).
+    /// A note is running: the supervisor owns its stall, its deadline and its deafness, instead of
+    /// three separate timers racing (S4).
+    fn watch_note(&self, voice: &Voice) {
+        let started = self.inner.note_ms.load(Ordering::SeqCst);
+        let elapsed = now_ms().saturating_sub(started);
+        if voice.starting() && elapsed > STALL_MS {
+            self.log("note_stalled", serde_json::json!({ "after_ms": elapsed }));
+            self.log("note_stopped", serde_json::json!({ "from": "stalled" }));
+            if let Err(error) = voice.cancel() {
+                self.log("failed", serde_json::json!({ "reason": error.to_string() }));
+            }
+            self.recover();
+            return;
+        }
+        // A capture that opens and never delivers a frame never reaches the auto-stop, which counts
+        // the audio it hears: the supervisor sees the frame counter itself (S4).
+        let silent = voice.frames_seen() == self.inner.frames_at_note.load(Ordering::SeqCst);
+        if silent && elapsed > self.inner.guard_silent_ms.load(Ordering::SeqCst) {
+            self.log("note_deaf", serde_json::json!({ "after_ms": elapsed }));
+            self.stop();
+            return;
+        }
+        let deadline = self.inner.deadline_ms.load(Ordering::SeqCst);
+        if elapsed > deadline {
+            self.log("note_deadline", serde_json::json!({ "after_ms": elapsed }));
+            self.stop();
+        }
+    }
+
+    /// A capture is listening: it counts as alive only when the frame counter moved since it opened.
+    /// Otherwise the chain walks to the next input — the same device, then the default, then the
+    /// built-in — and the supervisor is the only caller of either side (S1, T8).
+    fn watch_capture(&self, voice: &Voice) {
+        let frames = voice.frames_seen();
+        if frames > self.inner.frames_at_arm.load(Ordering::SeqCst) {
+            // Frames arrive, so this capture is healthy and the next loss starts the chain over.
+            self.inner.silent_attempts.store(0, Ordering::SeqCst);
+            self.inner.force_default.store(false, Ordering::SeqCst);
+            self.inner.use_built_in.store(false, Ordering::SeqCst);
+            return;
+        }
+        let age = now_ms().saturating_sub(self.inner.armed_ms.load(Ordering::SeqCst));
+        if age < self.inner.guard_silent_ms.load(Ordering::SeqCst) {
+            // A capture gets its whole tolerance to deliver a first frame.
+            return;
+        }
+        let attempt = self.inner.silent_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        self.log("capture_lost", serde_json::json!({ "silent_ms": age, "attempt": attempt, "device": self.device() }));
+        if attempt > CAPTURE_RETRIES {
+            if !self.inner.force_default.swap(true, Ordering::SeqCst) {
+                self.log("device_fallback", serde_json::json!({ "to": "the system default input", "attempt": attempt }));
+            } else if !self.inner.use_built_in.swap(true, Ordering::SeqCst) {
+                self.log("device_fallback", serde_json::json!({ "to": "the built-in microphone", "attempt": attempt }));
+            } else {
+                // Every input had its turn: stop cycling the device and wait for the next event.
+                self.log("capture_gave_up", serde_json::json!({ "attempts": attempt }));
+                return;
+            }
+        }
+        self.recover();
+    }
+
+    /// The supervisor's clock and tolerance, shortened so a test does not wait seconds (S1).
     pub fn set_capture_guard(&self, tick: std::time::Duration, tolerance: std::time::Duration) {
         self.inner.guard_tick_ms.store(tick.as_millis() as u64, Ordering::SeqCst);
         self.inner.guard_silent_ms.store(tolerance.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Gives the microphone back to a fresh capture, from the one place allowed to do it.
+    fn recover(&self) {
+        self.disarm();
+        self.resume();
     }
 
     /// The deadline, shortened so a test does not wait a minute for it (S4).
@@ -1355,6 +1344,25 @@ mod tests {
             rig.recorder.seen().iter().any(|event| matches!(event, VoiceEvent::Transcript(_)))
         });
         assert_eq!(rig.chime.count(), 1, "the end of the note is silent");
+    }
+
+    #[test]
+    fn a_note_that_opens_and_hears_nothing_is_ended_by_the_supervisor() {
+        // The microphone's owner watches the note's own frame counter now: a note whose capture
+        // opened and delivered nothing is ended and reported, instead of holding the device until
+        // the deadline or forever (T5, T6).
+        let rig = wake_rig("deafnote", true);
+        rig.wake.set_capture_guard(Duration::from_millis(10), Duration::from_millis(60));
+        rig.wake.set(true).unwrap();
+        rig.detector.detect(0.6);
+        rig.mic.sink().audio(&[0.2; 480]);
+        wait_until("the note starts", || rig.mic.log.lock().unwrap().opened == 2);
+        // The note's capture is given no audio at all.
+        wait_until("the note is ended", || {
+            rig.recorder.seen().iter().any(|event| matches!(event, VoiceEvent::Transcript(_)))
+        });
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        assert!(log.contains("\"note_deaf\""), "{log}");
     }
 
     #[test]

@@ -640,6 +640,10 @@ impl Sink {
             if session.recording != self.recording {
                 return;
             }
+            // The note's capture counts frames too: without this the only measure of "this capture
+            // delivers" belongs to the detector, and a note that opened mute is invisible (T6).
+            inner.last_frame_ms.store(millis(), Ordering::SeqCst);
+            inner.frames_seen.fetch_add(1, Ordering::SeqCst);
             session.peak = session.peak.max(audio::rms(samples));
             let now = inner.clock.now_ms();
             let due = session.last_level_ms.is_none_or(|last| now.saturating_sub(last) >= LEVEL_INTERVAL_MS);
