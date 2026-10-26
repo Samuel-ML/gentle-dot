@@ -17,7 +17,11 @@ use crate::computer::SystemClock;
 use crate::config::DesktopConfig;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// How long each retry waits before trying the microphone again: a second, then doubling.
+const RETRY_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
 
 /// The commands, as registered in `build.rs` and granted to the panel.
@@ -243,6 +247,11 @@ struct WakeInner {
     /// The microphone the panel chose (`None` is the system default), so the detector and the
     /// note it starts listen to the same one (S2).
     device: Mutex<Option<String>>,
+    /// Bumped whenever the switch changes, so a retry scheduled for an older state stops.
+    generation: AtomicU64,
+    /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
+    /// the switch cannot claim to be listening while the microphone is gone (S1).
+    failure: Mutex<Option<String>>,
 }
 
 impl Wake {
@@ -257,6 +266,8 @@ impl Wake {
                 events,
                 enabled: Mutex::new(false),
                 device: Mutex::new(config.voice_input.as_ref().map(|input| input.uid.clone())),
+                generation: AtomicU64::new(0),
+                failure: Mutex::new(None),
             }),
             detector: cfg!(target_os = "macos").then(|| Arc::new(open_model) as Load),
             chime: wake::platform_chime(),
@@ -287,9 +298,43 @@ impl Wake {
     /// panel's tooltip when the switch cannot be used (S1).
     pub fn status(&self) -> WakeStatus {
         let enabled = self.enabled();
-        match self.reason() {
+        match self.reason().or_else(|| enabled.then(|| self.failure()).flatten()) {
             None => WakeStatus { enabled, available: true, reason: None },
             Some(reason) => WakeStatus { enabled, available: false, reason: Some(reason) },
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::SeqCst)
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.inner.failure.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    fn set_failure(&self, reason: Option<String>) {
+        *self.inner.failure.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+    }
+
+    /// Tries to listen again after a while, because a microphone that refuses to start is usually
+    /// gone for a moment (a headset unplugged, the Mac waking, another app holding the input), and
+    /// giving up left the switch on with nothing listening (S1).
+    fn retry(&self, attempt: usize) {
+        if attempt >= RETRY_MS.len() {
+            return;
+        }
+        let delegate = self.clone();
+        let generation = self.generation();
+        let wait = std::time::Duration::from_millis(RETRY_MS[attempt]);
+        let spawned = std::thread::Builder::new().name("wake-retry".into()).spawn(move || {
+            std::thread::sleep(wait);
+            if delegate.generation() != generation || !delegate.enabled() {
+                return;
+            }
+            delegate.resume_after(attempt + 1);
+        });
+        if spawned.is_err() {
+            self.log("failed", serde_json::json!({ "reason": "cannot schedule a retry for the microphone" }));
         }
     }
 
@@ -309,6 +354,8 @@ impl Wake {
 
     fn set_enabled(&self, enabled: bool) {
         *self.inner.enabled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+        // Any retry scheduled for the previous state is stale now.
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Why nothing can listen here: no detector on this platform, or no reference file (S4).
@@ -400,14 +447,26 @@ impl Wake {
 
     /// Waits for the phrase again after a recording, which always disarms the listener.
     fn resume(&self) {
+        self.resume_after(0);
+    }
+
+    /// One attempt to listen, and the retry that follows a microphone that is not ready yet.
+    fn resume_after(&self, attempt: usize) {
         let Some(voice) = self.inner.voice.clone() else { return };
         if !self.enabled() || self.reason().is_some() {
             return;
         }
         match self.listen(&voice) {
+            // Listening again: whatever failed before no longer does.
+            Ok(()) => self.set_failure(None),
             // A note still running keeps the microphone; its own end resumes the detector.
-            Ok(()) | Err(VoiceError::Busy) | Err(VoiceError::Cancelled) => {}
-            Err(error) => self.log("failed", serde_json::json!({ "reason": error.to_string() })),
+            Err(VoiceError::Busy) | Err(VoiceError::Cancelled) => {}
+            Err(error) => {
+                let reason = error.to_string();
+                self.set_failure(Some(reason.clone()));
+                self.log("failed", serde_json::json!({ "reason": reason, "attempt": attempt }));
+                self.retry(attempt);
+            }
         }
     }
 
@@ -988,6 +1047,45 @@ mod tests {
         assert_eq!(transcript, Some(VoiceEvent::Transcript("hola".into())));
         // And the phrase is waited for again, on a capture of its own.
         wait_until("the detector listens again", || rig.mic.log.lock().unwrap().opened == 3);
+    }
+
+    #[test]
+    fn a_microphone_that_refuses_to_start_is_retried_and_the_switch_says_so() {
+        let rig = wake_rig("retry", true);
+        rig.mic.set_open_error(Some(VoiceError::Failed("The microphone could not start.".into())));
+        rig.wake.set(true).unwrap_err();
+        // Turning it on failed, so nothing listens and the switch is off.
+        assert!(!rig.wake.status().enabled);
+
+        // Armed while the microphone is fine, then the capture is dropped (an interruption, a
+        // headset unplugged, the Mac waking) and the microphone refuses to open again.
+        rig.mic.set_open_error(None);
+        rig.wake.set(true).unwrap();
+        rig.wake.disarm();
+        rig.mic.set_open_error(Some(VoiceError::Failed("The microphone could not start.".into())));
+        rig.wake.resume();
+        let status = rig.wake.status();
+        assert!(!status.available, "a microphone that refused must be visible in the panel");
+        assert_eq!(status.reason.as_deref(), Some("The microphone could not start."));
+
+        // Whatever made it refuse goes away: the retry listens again without the user's help.
+        let opened = rig.mic.log.lock().unwrap().opened;
+        rig.mic.set_open_error(None);
+        wait_until("the retry arms the microphone again", || rig.mic.log.lock().unwrap().opened > opened);
+        assert!(rig.wake.status().available, "the switch stops warning once it listens again");
+    }
+
+    #[test]
+    fn turning_the_detector_off_stops_the_pending_retries() {
+        let rig = wake_rig("retry-off", true);
+        rig.wake.set(true).unwrap();
+        rig.mic.set_open_error(Some(VoiceError::Failed("The microphone could not start.".into())));
+        rig.wake.resume();
+        rig.wake.set(false).unwrap();
+        let opened = rig.mic.log.lock().unwrap().opened;
+        rig.mic.set_open_error(None);
+        std::thread::sleep(std::time::Duration::from_millis(1_400));
+        assert_eq!(rig.mic.log.lock().unwrap().opened, opened, "a switch that is off does not retry");
     }
 
     #[test]

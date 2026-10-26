@@ -72,6 +72,13 @@ impl FakeMicrophone {
     }
 }
 
+impl FakeMicrophone {
+    /// Makes the next captures fail, or lets them work again.
+    pub fn set_open_error(&self, error: Option<VoiceError>) {
+        *self.open_error.lock().unwrap() = error;
+    }
+}
+
 impl Microphone for FakeMicrophone {
     fn authorization(&self) -> Authorization {
         *self.authorization.lock().unwrap()
