@@ -102,6 +102,9 @@ impl Microphone for FakeMicrophone {
 
     fn open(&self, device: Option<&str>, sink: AudioSink) -> Result<Box<dyn Stream>, VoiceError> {
         if let Some(error) = self.open_error.lock().unwrap().clone() {
+            // A refused capture still records which device was asked for: the fallback chain is
+            // only observable through it.
+            self.log.lock().unwrap().devices.push(device.map(str::to_string));
             return Err(error);
         }
         let mut log = self.log.lock().unwrap();

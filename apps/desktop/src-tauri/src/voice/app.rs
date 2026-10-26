@@ -41,6 +41,12 @@ const CAPTURE_TICK_MS: u64 = 2_000;
 const CAPTURE_SILENT_MS: u64 = 8_000;
 const CAPTURE_RETRIES: usize = 3;
 
+/// The last link of the chain: when neither the chosen input nor the system default delivers
+/// anything (a Bluetooth headset that slept, a device that went away), the built-in microphone
+/// keeps the wake word alive. It is named by UID so it is used whether or not it is the default.
+#[cfg(target_os = "macos")]
+const BUILT_IN_INPUT: &str = "BuiltInMicrophoneDevice";
+
 
 /// The commands, as registered in `build.rs` and granted to the panel.
 pub const COMMANDS: [&str; 13] = [
@@ -304,6 +310,8 @@ struct WakeInner {
     /// Set when the chosen input never delivers and the system default is used instead, for this
     /// session only: the stored choice is never overwritten (S1).
     force_default: AtomicBool,
+    /// Set when the built-in microphone had to take over because nothing else delivered audio.
+    use_built_in: AtomicBool,
     /// What the detector listens for; the panel may change it (S30.7).
     phrase: Mutex<wake::Phrase>,
     /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
@@ -326,6 +334,7 @@ impl Wake {
                 guard_silent_ms: std::sync::atomic::AtomicU64::new(CAPTURE_SILENT_MS),
                 silent_attempts: AtomicUsize::new(0),
                 force_default: std::sync::atomic::AtomicBool::new(false),
+                use_built_in: AtomicBool::new(false),
                 deadline_ms: std::sync::atomic::AtomicU64::new(NOTE_DEADLINE_MS),
                 notes: AtomicU64::new(0),
                 phrase: Mutex::new(wake::Phrase::typed(&config.wake_phrase)),
@@ -415,11 +424,25 @@ impl Wake {
 
     /// The microphone the panel chose, or `None` for the system default.
     fn device(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        if self.inner.use_built_in.load(Ordering::SeqCst) {
+            // Neither the choice nor the default delivered a frame: the built-in keeps the channel.
+            return Some(BUILT_IN_INPUT.to_string());
+        }
         if self.inner.force_default.load(Ordering::SeqCst) {
             // The chosen input never delivered a frame; the default keeps the channel alive.
             return None;
         }
         self.inner.device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// True the first time the built-in takes over, so the log says it once.
+    fn fall_back_to_built_in(&self, because: &str) -> bool {
+        if self.inner.use_built_in.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.log("device_fallback", serde_json::json!({ "to": "the built-in microphone", "because": because }));
+        true
     }
 
     /// Keeps the detector on the same microphone the panel just chose.
@@ -521,13 +544,23 @@ impl Wake {
         // Diagnostic wrapper (temporary): the first frame the detector receives goes into the wake
         // log, so a run with no match can tell "no audio arrived" apart from "audio that never
         // scored". `eprintln!` cannot: a bundle launched from the Finder has no visible stderr.
-        let armed = voice.arm(self.device().as_deref(), detector, self.listen_events());
+        let armed = voice.arm(self.device().as_deref(), detector.clone(), self.listen_events());
+        let armed = match &armed {
+            Ok(()) => armed,
+            Err(error) => {
+                self.log("failed", serde_json::json!({ "step": "arm", "reason": error.to_string() }));
+                // A device that is gone makes the arm fail outright; the built-in takes over so the
+                // switch cannot end up on with nothing listening.
+                if self.fall_back_to_built_in(&error.to_string()) {
+                    voice.arm(self.device().as_deref(), detector, self.listen_events())
+                } else {
+                    armed
+                }
+            }
+        };
         if armed.is_ok() {
             // The channel that just opened is watched from its first tick (S1).
             self.guard_capture();
-        }
-        if let Err(error) = &armed {
-            self.log("failed", serde_json::json!({ "step": "arm", "reason": error.to_string() }));
         }
         armed
     }
@@ -768,6 +801,13 @@ impl Wake {
             // makes it blink. Stop here; the next arm (a note ending, the switch, a restart) starts
             // a fresh guard with a fresh clock.
             if delegate.inner.force_default.load(Ordering::SeqCst) {
+                // The default is mute too. The built-in is the last input left, and it is tried once
+                // before giving up: a sleeping headset must not leave the wake word dead.
+                if delegate.fall_back_to_built_in("no frames on the default input") {
+                    delegate.disarm();
+                    delegate.resume();
+                    return;
+                }
                 delegate.log("capture_gave_up", serde_json::json!({ "attempts": attempt }));
                 return;
             }
@@ -1409,6 +1449,25 @@ mod tests {
         assert!(log.contains("\"capture_lost\""), "{log}");
         assert!(rig.mic.log.lock().unwrap().opened >= 4, "three retries, then the fallback");
         assert!(rig.wake.status().enabled, "the switch never turns itself off");
+    }
+
+    #[test]
+    fn a_device_that_is_gone_hands_over_to_the_built_in() {
+        // Toggling the switch did nothing when the chosen input had vanished: the arm failed, the
+        // switch went back off and the microphone stayed dark. The built-in microphone is the last
+        // link of the chain, so the channel is still there to listen with.
+        let rig = wake_rig("gone", true);
+        rig.mic.set_open_error(Some(VoiceError::Failed("The microphone could not start.".into())));
+        let error = rig.wake.set(true);
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap_or_default();
+        assert!(log.contains("\"device_fallback\""), "{log}");
+        assert!(
+            rig.mic.log.lock().unwrap().devices.iter().flatten().any(|uid| uid == "BuiltInMicrophoneDevice"),
+            "the built-in was asked for: {:?}",
+            rig.mic.log.lock().unwrap().devices
+        );
+        // The fake still refuses every capture, so the switch comes back off with the reason.
+        assert!(error.is_err(), "a microphone that never opens cannot claim to listen");
     }
 
     #[test]
