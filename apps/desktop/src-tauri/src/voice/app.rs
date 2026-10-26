@@ -668,6 +668,7 @@ impl Wake {
             }
             let Some(voice) = delegate.inner.voice.clone() else { return };
             if !voice.starting() {
+                delegate.log("note_stall_skipped", serde_json::json!({ "because": "the note started" }));
                 return;
             }
             delegate.log("note_stalled", serde_json::json!({ "after_ms": STALL_MS }));
@@ -688,11 +689,17 @@ impl Wake {
         let wait = std::time::Duration::from_millis(self.inner.deadline_ms.load(Ordering::SeqCst));
         let spawned = std::thread::Builder::new().name("wake-deadline".into()).spawn(move || {
             std::thread::sleep(wait);
-            if delegate.inner.notes.load(Ordering::SeqCst) != mine {
+            let now = delegate.inner.notes.load(Ordering::SeqCst);
+            if now != mine {
+                delegate.log("note_deadline_skipped", serde_json::json!({ "because": "another note started", "note": mine, "current": now }));
                 return;
             }
-            let Some(voice) = delegate.inner.voice.clone() else { return };
+            let Some(voice) = delegate.inner.voice.clone() else {
+                delegate.log("note_deadline_skipped", serde_json::json!({ "because": "no voice backend" }));
+                return;
+            };
             if !voice.busy() {
+                delegate.log("note_deadline_skipped", serde_json::json!({ "because": "the note already ended" }));
                 return;
             }
             // A start that never became a recording is the Bluetooth stall: nothing was captured,
