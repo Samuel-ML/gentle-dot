@@ -73,3 +73,10 @@ stops working. Fix: one capture at a time, a paused detector, and a resume that 
   capture history (7 opens, 6 closes: the detector still owns the microphone).
   `a_note_that_never_starts_gives_the_detector_back` is red without the re-arm (`the detector listens
   again` times out) and green with it, which is the reported bug reproduced.
+- L7 — Follow-ups, each from a real session's log: `e488382` a note that hears nothing ends on the
+  wall clock; `0e9a404` a note stuck starting is cancelled; `8d99e23` every declined resume logs
+  `resume_skipped` and a switch the disk says is on is restored; `eb9073f` the engine is never asked
+  for the device it already uses; `208fdc1` the listen channel is watched (8 s without a frame → 3
+  retries with backoff → the system default for the session); `ec60e87` a note that outlives its
+  deadline says why; `2a8c61b` an empty transcript still reaches the panel, which is the freeze the
+  user saw on the second note (frozen timer, dead buttons, microphone already closed).
