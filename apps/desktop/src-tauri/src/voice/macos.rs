@@ -167,6 +167,13 @@ struct Started {
     channels: usize,
 }
 
+/// Whether the requested device has to be selected on the audio unit. It does not when it already
+/// is the system default: the engine uses the default on its own, and asking for it explicitly is
+/// the call that hangs (a known AVAudioEngine trap).
+fn selects(requested: &str, default: Option<&str>) -> bool {
+    default != Some(requested)
+}
+
 /// What an attempt opens, named the way the log and the errors name it.
 fn opening(device: Option<&str>) -> String {
     device.map_or_else(|| "the system default input".to_string(), |uid| format!("the microphone \"{uid}\""))
@@ -203,9 +210,13 @@ fn start(
     sink: &AudioSink,
 ) -> Result<Started, VoiceError> {
     // The device belongs to the input node's audio unit, so it is chosen before `prepare()`; the
-    // format read below is then the one that device carries.
+    // format read below is then the one that device carries. A device that already is the system
+    // default is left alone: setting it on the unit makes AVAudioEngine hang with no microphone
+    // indicator, no error and no frames, which is the silence this app kept chasing.
     if let Some(uid) = device {
-        core_audio::select_input(audio_unit(&input), uid).map_err(VoiceError::Failed)?;
+        if selects(uid, core_audio::default_input_uid().as_deref()) {
+            core_audio::select_input(audio_unit(&input), uid).map_err(VoiceError::Failed)?;
+        }
     }
     // SAFETY: the node's own format for its output bus, borrowed for the call.
     let format = unsafe { input.outputFormatForBus(0) };
@@ -410,5 +421,19 @@ impl Recognition for AppleRecognition {
     fn cancel(&mut self) {
         // SAFETY: cancelling a live task; its late "cancelled" error is ignored by the sink.
         unsafe { self.task.cancel() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selects;
+
+    #[test]
+    fn the_system_default_input_is_not_selected_on_the_engine() {
+        // Asking AVAudioEngine for the device it already uses makes it hang with no microphone
+        // indicator and no error, so the default is left to the engine.
+        assert!(!selects("54-84-50-E5-19-DE:input", Some("54-84-50-E5-19-DE:input")));
+        assert!(selects("BuiltInMicrophoneDevice", Some("54-84-50-E5-19-DE:input")));
+        assert!(selects("BuiltInMicrophoneDevice", None), "no default to compare against");
     }
 }
