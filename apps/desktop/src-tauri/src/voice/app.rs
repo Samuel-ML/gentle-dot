@@ -228,7 +228,8 @@ impl WakeStatus {
     }
 }
 
-/// How the reference file becomes a detector; a test swaps in a scripted one.
+/// A detector a test scripts in place of the local model. Production injects none, so the
+/// local model is what listens and the saved phrase is the only thing that can start a note.
 type Load = Arc<dyn Fn(&Path) -> Result<Arc<dyn WakeWord>, String> + Send + Sync>;
 
 /// The wake word (S30.7, S1-S7): the saved flag, the reference it needs, and the log every match
@@ -240,7 +241,7 @@ type Load = Arc<dyn Fn(&Path) -> Result<Arc<dyn WakeWord>, String> + Send + Sync
 #[derive(Clone)]
 pub struct Wake {
     inner: Arc<WakeInner>,
-    /// Whether this build has a detector at all, and how its reference becomes one.
+    /// A detector a test scripts; production leaves it empty so the local model listens.
     detector: Option<Load>,
     /// The pip that tells the speaker the note started (S30.7).
     chime: Arc<dyn Chime>,
@@ -250,8 +251,6 @@ struct WakeInner {
     voice: Option<Voice>,
     /// `<data dir>/config.json`, where the flag lives (S1).
     config_file: PathBuf,
-    /// `<data dir>/wake-word/hey-dot.rpw` (S4).
-    model: PathBuf,
     /// Where the local model is installed, when it is: the model manager's own answer, over the
     /// models root `model.rs` uses, so the spike never guesses a path.
     parakeet: Locate,
@@ -277,7 +276,6 @@ impl Wake {
             inner: Arc::new(WakeInner {
                 voice,
                 config_file: config.data_dir.join("config.json"),
-                model: wake::model_path(&config.data_dir),
                 parakeet,
                 log: config.data_dir.join("wake-word.log"),
                 events,
@@ -287,14 +285,9 @@ impl Wake {
                 generation: AtomicU64::new(0),
                 failure: Mutex::new(None),
             }),
-            detector: cfg!(target_os = "macos").then(|| Arc::new(open_model) as Load),
+            detector: None,
             chime: wake::platform_chime(),
         };
-        // The phrase was "oye dot" before this build: an installation that already has its
-        // reference keeps working instead of being asked for the file again (S4).
-        if wake::adopt_legacy(&config.data_dir).is_some() {
-            wake.log("adopted", serde_json::json!({ "from": wake::LEGACY_MODEL_FILE, "to": wake::MODEL_FILE }));
-        }
         wake
     }
 
@@ -396,17 +389,21 @@ impl Wake {
 
     /// Why nothing can listen here: no detector on this platform, or no reference file (S4).
     fn reason(&self) -> Option<String> {
-        if self.inner.voice.is_none() || self.detector.is_none() {
+        // Listening needs the microphone tap this app has on macOS and Linux, and a detector:
+        // the local model in production, a scripted one in a test.
+        let platform = cfg!(any(target_os = "macos", target_os = "linux"));
+        if self.inner.voice.is_none() || !platform {
             return Some(UNSUPPORTED.to_string());
         }
-        // The spike listens with the local model, which it does not need a reference file for.
-        if self.local().is_some() {
+        // A scripted detector (tests only) answers for itself; otherwise the local model is the
+        // only detector, so without it there is nothing to listen with.
+        if self.detector.is_some() {
             return None;
         }
-        if !self.inner.model.is_file() {
-            return Some(wake::missing(&self.inner.model));
+        match self.local() {
+            Some(_) => None,
+            None => Some(wake::parakeet_absent()),
         }
-        None
     }
 
     /// The installed local model's directory, when it is installed (`model.rs` checks every file
@@ -456,13 +453,13 @@ impl Wake {
     fn listen(&self, voice: &Voice) -> Result<(), VoiceError> {
         // Spike: the local model listening for the phrase when it is installed, the trained
         // reference otherwise. Loading either one takes seconds, so this runs off the audio thread.
-        let detector = match self.local() {
-            Some(dir) => Arc::new(
-                wake::ParakeetWake::load(&dir, self.inner.log.clone(), self.phrase()).map_err(VoiceError::Failed)?,
-            ) as Arc<dyn WakeWord>,
+        let detector = match &self.detector {
+            Some(load) => load(self.local().as_deref().unwrap_or(Path::new(""))).map_err(VoiceError::Failed)?,
             None => {
-                let load = self.detector.as_ref().ok_or(VoiceError::Unsupported)?;
-                load(&self.inner.model).map_err(VoiceError::Failed)?
+                let dir = self.local().ok_or(VoiceError::Unsupported)?;
+                Arc::new(
+                    wake::ParakeetWake::load(&dir, self.inner.log.clone(), self.phrase()).map_err(VoiceError::Failed)?,
+                ) as Arc<dyn WakeWord>
             }
         };
         // Diagnostic wrapper (temporary): the first frame the detector receives goes into the wake
@@ -597,18 +594,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// The detector for this platform, loaded from the reference at `path` (S4). macOS only: it is
-/// the platform whose microphone this app has the tap for (S2).
-fn open_model(path: &Path) -> Result<Arc<dyn WakeWord>, String> {
-    #[cfg(target_os = "macos")]
-    return wake::RustpotterWake::load(path).map(|detector| Arc::new(detector) as Arc<dyn WakeWord>);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        Err(UNSUPPORTED.to_string())
-    }
 }
 
 /// The local model's files and the recognizer that keeps it loaded.
@@ -941,11 +926,8 @@ mod tests {
 
     /// The wake word with a scripted detector and a fake microphone: the whole path, with no
     /// reference file and no audio device.
-    fn wake_rig(name: &str, with_reference: bool) -> WakeRig {
+    fn wake_rig(name: &str, scripted: bool) -> WakeRig {
         let dir = scratch(name);
-        if with_reference {
-            std::fs::write(dir.join("wake-word").join(wake::MODEL_FILE), b"reference").unwrap();
-        }
         let mic = Arc::new(FakeMicrophone::granted());
         let recognizer = Arc::new(FakeRecognizer::granted());
         let voice = Voice::new(mic.clone(), recognizer.clone(), Arc::new(FakeClock(AtomicU64::new(0))));
@@ -957,8 +939,8 @@ mod tests {
         };
         let chime = Arc::new(CountingChime::default());
         let wake = Wake::new(Some(voice), &config(dir.clone()), recorder.events(), Arc::new(|| None))
-            .with_detector(load)
             .with_chime(chime.clone());
+        let wake = if scripted { wake.with_detector(load) } else { wake };
         WakeRig { wake, mic, recognizer, detector, recorder, chime, dir }
     }
 
@@ -986,10 +968,12 @@ mod tests {
     }
 
     #[test]
-    fn turning_it_on_without_the_reference_fails_with_the_reason_and_saves_nothing() {
+    fn turning_it_on_without_the_local_model_fails_with_the_reason_and_saves_nothing() {
+        // The local model is the only detector: without it nothing can hear the phrase, so the
+        // switch refuses and writes nothing rather than claiming to listen.
         let rig = wake_rig("missing", false);
         let error = rig.wake.set(true).unwrap_err();
-        assert!(error.contains("wake-word/hey-dot.rpw"), "{error}");
+        assert_eq!(error, wake::parakeet_absent());
         assert!(!rig.wake.status().enabled);
         assert!(!rig.wake.status().available);
         assert!(!rig.dir.join("config.json").exists(), "a flag that cannot work is not saved");
@@ -1145,6 +1129,16 @@ mod tests {
         rig.mic.set_open_error(None);
         std::thread::sleep(std::time::Duration::from_millis(1_400));
         assert_eq!(rig.mic.log.lock().unwrap().opened, opened, "a switch that is off does not retry");
+    }
+
+    #[test]
+    fn every_command_is_also_a_registered_handler() {
+        // The permission and the handler are two different lists: a command granted but not
+        // registered answers "Command … not found", which is how wake_phrase_set first shipped.
+        let handlers = include_str!("../shell.rs");
+        for command in COMMANDS {
+            assert!(handlers.contains(&format!("voice::{command}")), "{command} is not in generate_handler");
+        }
     }
 
     #[test]

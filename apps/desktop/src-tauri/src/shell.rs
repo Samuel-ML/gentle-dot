@@ -818,7 +818,8 @@ pub fn run() {
             voice::voice_model_cancel,
             voice::voice_model_remove,
             voice::wake_word_status,
-            voice::wake_word_set
+            voice::wake_word_set,
+            voice::wake_phrase_set
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]

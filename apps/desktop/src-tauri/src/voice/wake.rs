@@ -5,10 +5,11 @@
 //! on that stream and the microphone hands it the same 16 kHz PCM it hands a recording. Nothing
 //! here opens a device, spawns a helper or listens on a second engine.
 //!
-//! `RustpotterWake` is the real detector (rustpotter, macOS only, the platform with that capture);
-//! `ParakeetWake` is the spike: the local model, already installed for dictation, listens for the
-//! phrase in its own transcript instead of a trained reference; `FakeWake` plays detections on
-//! demand so every rule is tested on every platform without a microphone.
+//! `ParakeetWake` is the only detector: the local model, already installed for dictation, listens
+//! for the phrase in its own transcript. The phrase saved in the settings is therefore the only
+//! thing that can start a note — no second, template-based detector is left to match an older
+//! recording. `FakeWake` plays detections on demand so every rule is tested on every platform
+//! without a microphone.
 
 use super::audio::SAMPLE_RATE;
 use super::parakeet::{self, Engine};
@@ -36,40 +37,6 @@ pub trait WakeWord: Send + Sync {
     fn reset(&self);
 }
 
-/// The reference's file name. It is a voice signature, so it lives in the data dir (S4), is never
-/// bundled with the build, is never committed, and `*.rpw` is in `.gitignore`.
-pub const MODEL_FILE: &str = "hey-dot.rpw";
-/// The detector's name for the phrase, and the model name the log records.
-pub const WAKE_WORD: &str = "oye-doti";
-/// The reference detector's operating point, measured on this machine (S7, L4): four samples,
-/// leave-one-out margin 0.062, and no usable threshold from 0.50 up. It only applies when the
-/// local model is not installed and the trained reference listens instead; the transcription
-/// matcher that normally listens needs no threshold.
-pub const THRESHOLD: f32 = 0.45;
-pub const MIN_SCORES: usize = 5;
-
-/// `<data dir>/wake-word/hey-dot.rpw`, next to `config.json` (S4).
-pub fn model_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("wake-word").join(MODEL_FILE)
-}
-
-/// The file name this app used before the phrase was called "hey dot". The reference is the same
-/// recording, so an installation that already has one keeps working across the rename.
-pub const LEGACY_MODEL_FILE: &str = "oye-dot.rpw";
-
-/// Copies the reference installed under the old name to the current one, once: an installation
-/// that already worked must not be asked for the file again. Never overwrites, so a reference the
-/// user has since rebuilt always wins. Returns the new path when it copied.
-pub fn adopt_legacy(data_dir: &Path) -> Option<PathBuf> {
-    let current = model_path(data_dir);
-    let legacy = data_dir.join("wake-word").join(LEGACY_MODEL_FILE);
-    if current.exists() || !legacy.is_file() {
-        return None;
-    }
-    std::fs::copy(&legacy, &current).ok().map(|_| current)
-}
-
-/// A short system sound when a note starts, so speaking the phrase is enough to know it did
 /// (S30.7). Played once per note, at the start only, through the system's own output — it reaches
 /// headphones like any other system sound.
 pub trait Chime: Send + Sync {
@@ -109,27 +76,14 @@ pub fn platform_chime() -> std::sync::Arc<dyn Chime> {
     std::sync::Arc::new(Silent)
 }
 
-/// Why the detector has no reference to listen for, naming the file the user has to put there:
-/// the one thing the app cannot do for him (the file is his own voice, S4).
-pub fn missing(path: &Path) -> String {
-    format!(
-        "The wake word's voice reference is missing at {}. Put {MODEL_FILE} there, then turn the wake word on again.",
-        path.display()
-    )
-}
+/// The detector's name for the phrase, and the model name the log records.
+pub const WAKE_WORD: &str = "oye-doti";
 
 /// The spike's window: 1.5 s at 16 kHz, long enough for "oye dot" with the air around it.
 pub const WINDOW: usize = SAMPLE_RATE as usize * 3 / 2;
 /// The overlap between windows: 0.5 s, so a phrase said across a boundary is still heard whole.
 pub const HOP: usize = SAMPLE_RATE as usize / 2;
 
-/// The ways the speaker opens the phrase, and the ways Parakeet writes the name down. Matching the
-/// pair instead of a fixed list keeps the command usable when the model hears "hola dock" or
-/// "hey dot": the two words are the command, the exact spelling is not. Spanish does not end a
-/// word on /t/, which is why "dote" is here.
-/// The phrase is two words: "oye" and the name "Doti". Only the opener the user chose counts —
-/// there is no "hola doti" and no "hey doti" — while the name takes every spelling the recogniser
-/// writes for it. Accents are stripped before matching, so "oye dót" arrives here as "dot".
 /// The words the detector listens for, normalised once: the panel may type any phrase, so the
 /// rule cannot be a table of spellings (S30.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +163,12 @@ fn normalised(text: &str) -> String {
 }
 
 /// Why the spike cannot listen: the model directory the app downloads into is not there.
+/// Why the wake word cannot listen: the local model is the only detector, so without it there is
+/// nothing to hear the phrase with.
+pub fn parakeet_absent() -> String {
+    "The wake word needs the local speech model: install it from Settings, Voz, and turn the wake word on again.".to_string()
+}
+
 fn parakeet_missing(dir: &Path) -> String {
     format!(
         "The local voice model's files are missing at {}, so it cannot listen for the phrase. Download the local model again.",
@@ -360,79 +320,6 @@ impl WakeWord for ParakeetWake {
     fn reset(&self) {
         lock(&self.shared.buffer).clear();
         *lock(&self.shared.pending) = None;
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub use real::RustpotterWake;
-
-#[cfg(target_os = "macos")]
-mod real {
-    use super::{missing, Detection, WakeWord, MIN_SCORES, THRESHOLD, WAKE_WORD};
-    use rustpotter::{Rustpotter, RustpotterConfig};
-    use std::path::Path;
-    use std::sync::Mutex;
-
-    /// rustpotter wants whole frames (`get_samples_per_frame`, 480 samples = 30 ms at 16 kHz)
-    /// and the microphone's tap delivers about 21 ms, so chunks are buffered until a frame is
-    /// full. The detector is mutexed because the trait is shared: `accept` only ever runs on the
-    /// audio thread, one chunk at a time.
-    pub struct RustpotterWake {
-        pending: Mutex<Pending>,
-    }
-
-    struct Pending {
-        detector: Rustpotter,
-        samples: Vec<f32>,
-    }
-
-    impl RustpotterWake {
-        /// Loads the reference at `path`, configured with the measured operating point (S7). A
-        /// missing or unreadable file is reported with the path: nothing else tells the user
-        /// where the reference has to be (S4).
-        pub fn load(path: &Path) -> Result<Self, String> {
-            if !path.is_file() {
-                return Err(missing(path));
-            }
-            let mut config = RustpotterConfig::default();
-            config.detector.threshold = THRESHOLD;
-            config.detector.min_scores = MIN_SCORES;
-            let mut detector = Rustpotter::new(&config)?;
-            let file = path
-                .to_str()
-                .ok_or_else(|| format!("The wake word reference at {} is not a valid path.", path.display()))?;
-            detector
-                .add_wakeword_from_file(WAKE_WORD, file)
-                .map_err(|error| format!("The wake word reference at {} could not be read: {error}", path.display()))?;
-            Ok(RustpotterWake { pending: Mutex::new(Pending { detector, samples: Vec::new() }) })
-        }
-    }
-
-    impl WakeWord for RustpotterWake {
-        fn accept(&self, samples: &[f32]) -> Option<Detection> {
-            let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let frame = pending.detector.get_samples_per_frame();
-            pending.samples.extend_from_slice(samples);
-            // Every complete frame is processed, not one per callback: the capture delivers chunks
-            // larger than a frame, so one frame per chunk falls behind for good and the detector
-            // never reaches the phrase just spoken.
-            while pending.samples.len() >= frame {
-                let audio: Vec<f32> = pending.samples.drain(..frame).collect();
-                let Some(detection) = pending.detector.process_samples(audio) else { continue };
-                // The detector keeps its own history: a phrase already matched must not match
-                // again on the audio that follows it.
-                pending.samples.clear();
-                pending.detector.reset();
-                return Some(Detection { name: detection.name, score: detection.score, variant: None });
-            }
-            None
-        }
-
-        fn reset(&self) {
-            let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.samples.clear();
-            pending.detector.reset();
-        }
     }
 }
 
@@ -643,25 +530,6 @@ mod tests {
     }
 
     #[test]
-    fn the_reference_lives_under_the_data_dir() {
-        assert_eq!(model_path(Path::new("/data/dot")), Path::new("/data/dot").join("wake-word").join("hey-dot.rpw"));
-    }
-
-    #[test]
-    fn a_missing_reference_is_reported_with_the_path_and_the_file_name() {
-        let reason = missing(Path::new("/data/dot/wake-word/hey-dot.rpw"));
-        assert!(reason.contains("/data/dot/wake-word/hey-dot.rpw"), "{reason}");
-        assert!(reason.contains(MODEL_FILE), "{reason}");
-    }
-
-    #[test]
-    fn the_operating_point_is_the_measured_one() {
-        // Diagnostic run: the temporary point, so a match is recorded with its score. Restore or
-        // recalibrate once the score is known (see THRESHOLD's own note).
-        assert_eq!((THRESHOLD, MIN_SCORES), (0.45, 5));
-    }
-
-    #[test]
     fn a_scripted_detection_is_played_once_and_the_audio_is_kept() {
         let wake = FakeWake::default();
         wake.detect(0.51);
@@ -673,28 +541,17 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_under_the_old_name_is_adopted_once_and_never_overwritten() {
-        let dir = std::env::temp_dir().join(format!("gentle-dot-adopt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("wake-word")).unwrap();
-        assert_eq!(adopt_legacy(&dir), None, "nothing to adopt yet");
-
-        std::fs::write(dir.join("wake-word").join(LEGACY_MODEL_FILE), b"old").unwrap();
-        assert_eq!(adopt_legacy(&dir), Some(model_path(&dir)));
-        assert_eq!(std::fs::read(model_path(&dir)).unwrap(), b"old");
-
-        std::fs::write(dir.join("wake-word").join(LEGACY_MODEL_FILE), b"older").unwrap();
-        assert_eq!(adopt_legacy(&dir), None, "the adopted reference wins");
-        assert_eq!(std::fs::read(model_path(&dir)).unwrap(), b"old");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn loading_a_reference_that_is_not_there_names_the_file() {
-        let path = std::env::temp_dir().join(format!("gentle-dot-no-wake-{}", std::process::id())).join(MODEL_FILE);
-        let error = RustpotterWake::load(&path).err().expect("a missing reference is an error");
-        assert!(error.contains("missing"), "{error}");
-        assert!(error.contains(path.to_str().unwrap()), "{error}");
+    fn only_the_saved_phrase_wakes_the_app() {
+        // The phrase in the settings is the whole rule: no template of an older recording is left
+        // to match something the user did not type, and no near phrase takes its place.
+        let phrase = Phrase::typed("oye Doti");
+        assert!(phrase.said("oye doti").is_some());
+        for other in ["oye dot", "hey doti", "oye", "doti", "oye dote"] {
+            assert_eq!(phrase.said(other), None, "{other}");
+        }
+        // Saving another phrase moves the command instead of adding one.
+        let changed = Phrase::typed("hey dot");
+        assert_eq!(changed.said("oye doti"), None, "the old phrase stops working");
+        assert_eq!(changed.said("hey dot").as_deref(), Some("hey dot"));
     }
 }
