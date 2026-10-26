@@ -25,10 +25,23 @@ nothing. This task is an audit, not another patch: the design is under suspicion
 | T1 | S2, S3 | `gentle-ai-explore`: audio backend and device lifecycle (macos.rs, core_audio.rs, machine.rs open/close/arm) | — |
 | T2 | S2, S4 | `gentle-ai-explore`: state machine and actors that touch the microphone (machine.rs, app.rs woken path, guard/deadline/stall/retry) | — |
 | T3 | S5 | `gentle-ai-explore`: panel contract (voice-native.ts, useVoice.ts, SettingsPanel) | — |
-| T4 | S1, S2 | Synthesize the three reports into one root cause, one plan, and ask before writing code | — |
+| T4 ✅ | S1, S2 | Synthesize the three reports into one root cause, one plan, and ask before writing code | — |
+| T5 | S2, S4 | Supervisor: one owner of `(enabled, capture, delivering)`; the only caller of arm/disarm/resume; every other actor sends it an intent | — |
+| T6 | S2 | Liveness for both sinks: a frame count per capture (Listener and Recording), so "open and mute" is observed where it happens | — |
+| T7 | S5 | One state contract: `voice://state {wake, capture, mic}` on every transition; the panel mirrors it, and `set` rolls back so the switch never lies | — |
+| T8 | S3 | Device chain in one place (chosen → default → built-in) with the sticky flags reset when frames arrive | — |
 
 ## Log
 
 - L1 — "espera, estás implementando por implementar, solo buscando salidas al primer error que te
   diga, tienes que hacer una exploración de la solución completa usando agentes y recién buscar cuál
   puede ser el problema de fondo, si te ayuda usar odd más tasks úsalo"
+- L2 — Audit verdicts. T1: `Ok` from `startAndReturnError` only means the engine started, `open` falls
+  back to the default only on `Err`, and the frame counters feed only the `Listener` sink, so a note
+  has no liveness at all. T2: seven orderings leave the microphone off with the switch on, and the
+  flags that cause them are process-sticky, so toggling cannot recover; verdict is one owner, not
+  more guards. T3: a wake-started note sets `phase=recording` without a ticker or a `recording`
+  entry, so the timer freezes and all three buttons early-return, and `set` leaves the switch lying in
+  both directions.
+- L3 — Root cause: the switch, the open capture and "delivering frames" are three independent truths
+  with no single writer. Every symptom is one of their contradictions.
