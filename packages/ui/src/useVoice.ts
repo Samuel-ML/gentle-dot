@@ -361,7 +361,9 @@ export function useVoice(state: DotState, send: Send): VoiceControls {
 				if (phaseNow.current === "recording") setLevel(value);
 			},
 			error: (message) => {
-				if (recording.current?.kind === "native") finish(message);
+				// A note the wake word started has no button press behind it, so the recording state is
+				// the panel's phase, not a `recording` entry: both end here.
+				if (phaseNow.current === "recording" || recording.current?.kind === "native") finish(message);
 			},
 			// The wake word (S30.7): nobody pressed the button, so the panel mirrors the state the
 			// app already entered and sends the transcript through the same path a stopped note uses.

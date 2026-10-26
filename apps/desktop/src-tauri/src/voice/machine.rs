@@ -689,6 +689,13 @@ impl Sink {
                 drop(state);
                 inner.changed.notify_all();
                 (session.events)(VoiceEvent::Error(message.to_string()));
+                // Nobody pressed the button for a note the wake word started, so the panel has no
+                // reply to wait for: without the terminal event it stays recording forever when the
+                // capture dies mid-note. An empty transcript is that event, and the panel already
+                // knows what to do with it.
+                if session.woken.is_some() {
+                    (session.events)(VoiceEvent::Transcript(String::new()));
+                }
                 discard(session);
             }
             _ => {}
@@ -1121,6 +1128,25 @@ mod tests {
         rig.voice.stop().unwrap();
         assert_eq!(rig.listen(&wake), Ok(()), "a finished recording leaves the listener disarmed");
         assert_eq!(rig.mic.log.lock().unwrap().opened, 3);
+    }
+
+    #[test]
+    fn a_woken_note_the_engine_kills_still_tells_the_panel_it_ended() {
+        // The third-note freeze: the capture died mid-note, the machine went idle on its own and the
+        // panel was left recording with no reply to wait for. The failure now carries the terminal
+        // transcript too, empty, which is the event the panel leaves its recording state on.
+        let rig = granted();
+        rig.voice.start_woken(None, None, rig.recorder.events(), rig.listenings.events()).unwrap();
+        rig.feed(SPEECH, 500);
+        // The capture's own failure callback, as the platform backend reports it.
+        rig.mic.sink().failed("The microphone went away.");
+        let seen = rig.recorder.seen();
+        assert!(seen.iter().any(|event| matches!(event, VoiceEvent::Error(_))), "{seen:?}");
+        assert!(
+            seen.iter().any(|event| matches!(event, VoiceEvent::Transcript(text) if text.is_empty())),
+            "the panel is told the note ended: {seen:?}"
+        );
+        assert_eq!(rig.voice.status().available, true, "the voice input is still usable");
     }
 
     #[test]
