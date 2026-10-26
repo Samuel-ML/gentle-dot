@@ -26,9 +26,9 @@ nothing. This task is an audit, not another patch: the design is under suspicion
 | T2 | S2, S4 | `gentle-ai-explore`: state machine and actors that touch the microphone (machine.rs, app.rs woken path, guard/deadline/stall/retry) | — |
 | T3 | S5 | `gentle-ai-explore`: panel contract (voice-native.ts, useVoice.ts, SettingsPanel) | — |
 | T4 ✅ | S1, S2 | Synthesize the three reports into one root cause, one plan, and ask before writing code | — |
-| T5 | S2, S4 | Supervisor: one owner of `(enabled, capture, delivering)`; the only caller of arm/disarm/resume; every other actor sends it an intent | — |
-| T6 | S2 | Liveness for both sinks: a frame count per capture (Listener and Recording), so "open and mute" is observed where it happens | — |
-| T7 | S5 | One state contract: `voice://state {wake, capture, mic}` on every transition; the panel mirrors it, and `set` rolls back so the switch never lies | — |
+| T5 ✅ `051e264` | S2, S4 | Supervisor: one owner of `(enabled, capture, delivering)`; the only caller of arm/disarm/resume; every other actor sends it an intent | — |
+| T6 ✅ `051e264` | S2 | Liveness for both sinks: a frame count per capture (Listener and Recording), so "open and mute" is observed where it happens | — |
+| T7 ✅ `509041a` | S5 | One state contract: `voice://state {wake, capture, mic}` on every transition; the panel mirrors it, and `set` rolls back so the switch never lies | — |
 | T8 | S3 | Device chain in one place (chosen → default → built-in) with the sticky flags reset when frames arrive | — |
 
 ## Log
@@ -45,3 +45,12 @@ nothing. This task is an audit, not another patch: the design is under suspicion
   both directions.
 - L3 — Root cause: the switch, the open capture and "delivering frames" are three independent truths
   with no single writer. Every symptom is one of their contradictions.
+- L4 — Delivered. One supervisor per app decides listening, recovering or watching a note and is
+  the only caller of arm/disarm/resume; the per-note stall, deadline and fallback timers are gone.
+  The note's own capture counts frames, so a note that opened mute is observed (`note_deaf`) instead
+  of guessed from a clock. `voice://state` carries `{wake, capture}` on every transition and the panel
+  mirrors it; `set` rolls back so the switch cannot lie. `4715cf1`: `stop()` defers to the supervisor
+  when the machine is still closing, which is what produced a retry ladder of failed arms.
+- L5 — Still open: T8 (the device chain now walks chosen → default → built-in inside the supervisor,
+  but its transitions deserve a measurement with the headset awake and as the system input, and the
+  Bluetooth profile question is a platform limit, not a bug).
