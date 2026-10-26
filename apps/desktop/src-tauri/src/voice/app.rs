@@ -511,7 +511,20 @@ impl Wake {
     /// One attempt to listen, and the retry that follows a microphone that is not ready yet.
     fn resume_after(&self, attempt: usize) {
         let Some(voice) = self.inner.voice.clone() else { return };
-        if !self.enabled() || self.reason().is_some() {
+        // Every reason not to listen gets a line: a cycle that ends in silence is how "the
+        // microphone turned itself off" stayed invisible (S6).
+        if !self.enabled() {
+            if !crate::config::stored_wake_word(&self.inner.config_file) {
+                self.log("resume_skipped", serde_json::json!({ "because": "disabled" }));
+                return;
+            }
+            // The switch was on in `config.json` but off here: a save that failed, or a file edited
+            // by hand. The stored value wins and the detector comes back (S1).
+            self.log("flag_drift", serde_json::json!({ "stored": true }));
+            self.set_enabled(true);
+        }
+        if let Some(reason) = self.reason() {
+            self.log("resume_skipped", serde_json::json!({ "because": reason }));
             return;
         }
         match self.listen(&voice) {
@@ -1229,6 +1242,39 @@ mod tests {
         let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
         assert!(log.contains("\"note_deadline\""), "{log}");
         assert!(log.contains("\"note_stopped\""), "{log}");
+    }
+
+    #[test]
+    fn a_resume_that_does_not_listen_says_why() {
+        // The cycle ended at note_stopped with no closing line, which is exactly how "and then it
+        // never came back" stayed a mystery. A resume that declines now says so (S6).
+        let rig = wake_rig("declined", true);
+        rig.wake.set(true).unwrap();
+        rig.wake.set(false).unwrap();
+        rig.wake.resume();
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        let skipped = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["event"] == serde_json::json!("resume_skipped"))
+            .last()
+            .expect("the decline is logged");
+        assert_eq!(skipped["because"], serde_json::json!("disabled"));
+    }
+
+    #[test]
+    fn a_switch_the_disk_says_is_on_comes_back() {
+        // The flag lives in memory and in config.json. When they disagree the switch looks on while
+        // nothing listens, so the stored value wins and the detector is armed again (S1).
+        let rig = wake_rig("drift", true);
+        rig.wake.set(true).unwrap();
+        // Memory says off, the file still says on: a save that failed, or a hand edit.
+        rig.wake.set(false).unwrap();
+        std::fs::write(rig.dir.join("config.json"), r#"{ "wake_word": true }"#).unwrap();
+        rig.wake.resume();
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        assert!(log.contains("\"flag_drift\""), "{log}");
+        assert!(rig.mic.log.lock().unwrap().opened >= 2, "the detector is listening again");
     }
 
     #[test]

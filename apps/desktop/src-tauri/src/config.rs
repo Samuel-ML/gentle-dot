@@ -206,6 +206,16 @@ pub fn with_wake_phrase(file: Option<&str>, phrase: &str) -> Result<String, Stri
     Ok(text + "\n")
 }
 
+/// The flag `config.json` holds right now, for the app to compare with the one in memory: a save
+/// that failed, or a file edited by hand, leaves the switch saying one thing and the disk another.
+pub fn stored_wake_word(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| json["wake_word"].as_bool())
+        .unwrap_or(false)
+}
+
 /// Saves the phrase in `config.json`, privately and in place like every other key.
 pub fn save_wake_phrase(path: &Path, phrase: &str) -> Result<(), String> {
     let file = match std::fs::read_to_string(path) {
