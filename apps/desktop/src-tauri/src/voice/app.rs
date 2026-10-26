@@ -349,12 +349,11 @@ impl Wake {
     /// gone for a moment (a headset unplugged, the Mac waking, another app holding the input), and
     /// giving up left the switch on with nothing listening (S1).
     fn retry(&self, attempt: usize) {
-        if attempt >= RETRY_MS.len() {
-            return;
-        }
+        // The ladder keeps going at its slowest step for as long as the detector is on: a lost
+        // resume must never leave the wake word dead until the switch is toggled (S1).
         let delegate = self.clone();
         let generation = self.generation();
-        let wait = std::time::Duration::from_millis(RETRY_MS[attempt]);
+        let wait = std::time::Duration::from_millis(RETRY_MS[attempt.min(RETRY_MS.len() - 1)]);
         let spawned = std::thread::Builder::new().name("wake-retry".into()).spawn(move || {
             std::thread::sleep(wait);
             if delegate.generation() != generation || !delegate.enabled() {
@@ -490,10 +489,24 @@ impl Wake {
             return;
         }
         match self.listen(&voice) {
-            // Listening again: whatever failed before no longer does.
-            Ok(()) => self.set_failure(None),
-            // A note still running keeps the microphone; its own end resumes the detector.
-            Err(VoiceError::Busy) | Err(VoiceError::Cancelled) => {}
+            // Listening again: whatever failed before no longer does, and the log says so (S6).
+            Ok(()) => {
+                self.set_failure(None);
+                self.log("resumed", serde_json::json!({ "listening": voice.listening() }));
+            }
+            // The microphone is still closing the last capture, or the note has not finished
+            // releasing it. Whoever was supposed to re-arm may already have run, so this retries
+            // instead of assuming another path will (S1). Logged for the first steps only, so a
+            // detector that stays busy for hours does not fill the log.
+            Err(error @ (VoiceError::Busy | VoiceError::Cancelled)) => {
+                if attempt < RETRY_MS.len() {
+                    self.log(
+                        "resume_failed",
+                        serde_json::json!({ "reason": error.to_string(), "attempt": attempt, "retry": true }),
+                    );
+                }
+                self.retry(attempt);
+            }
             Err(error) => {
                 let reason = error.to_string();
                 self.set_failure(Some(reason.clone()));
@@ -530,14 +543,22 @@ impl Wake {
     /// the same `voice://*` events, plus the automatic stop (S6).
     fn record(&self) -> Result<(), String> {
         let voice = self.inner.voice.clone().ok_or_else(|| UNSUPPORTED.to_string())?;
-        voice
-            .start_woken(None, self.device().as_deref(), self.panel_events(), self.listen_events())
-            .map_err(|error| error.to_string())?;
+        // The detector gives the microphone up before the note takes it (S2).
+        self.log("paused", serde_json::json!({}));
+        let started = voice.start_woken(None, self.device().as_deref(), self.panel_events(), self.listen_events());
+        if let Err(error) = started {
+            // A note that never started must hand the detector back: the machine is already idle
+            // again, so without this the wake word stays dead until the switch is toggled (S1).
+            self.log("note_failed", serde_json::json!({ "reason": error.to_string() }));
+            self.resume();
+            return Err(error.to_string());
+        }
         // The panel did not press anything, so a short system pip says the note is running (S3),
         // and it is the only sound: the automatic stop is silent.
         self.chime.note_started();
         // The panel did not press anything, so it needs to know a note is running (S3).
         (self.inner.events)(VoiceEvent::Started);
+        self.log("note_started", serde_json::json!({}));
         Ok(())
     }
 
@@ -553,6 +574,8 @@ impl Wake {
                 Err(error) => self.log("failed", serde_json::json!({ "reason": error.to_string() })),
             }
         }
+        // The note's capture is closed here; the detector takes the microphone back next (S4).
+        self.log("note_stopped", serde_json::json!({}));
         self.resume();
     }
 
@@ -1090,6 +1113,93 @@ mod tests {
         assert_eq!(transcript, Some(VoiceEvent::Transcript("hola".into())));
         // And the phrase is waited for again, on a capture of its own.
         wait_until("the detector listens again", || rig.mic.log.lock().unwrap().opened == 3);
+    }
+
+    #[test]
+    fn a_note_that_never_starts_gives_the_detector_back() {
+        // The stranding path behind "the microphone goes quiet on its own": the note's capture never
+        // opens, the machine is already idle again, so without an explicit re-arm the detector dies
+        // here and stays dead (S1).
+        let rig = wake_rig("orphan", true);
+        rig.wake.set(true).unwrap();
+        rig.mic.set_open_error(Some(VoiceError::Failed("The microphone could not start.".into())));
+        rig.detector.detect(0.6);
+        rig.mic.sink().audio(&[0.2; 480]);
+        wait_until("the failure is logged", || {
+            std::fs::read_to_string(rig.dir.join("wake-word.log")).is_ok_and(|log| log.contains("\"note_failed\""))
+        });
+        assert!(rig.wake.status().enabled, "the switch does not turn itself off");
+
+        // The microphone recovers and the detector takes it back by itself.
+        rig.mic.set_open_error(None);
+        wait_until("the detector listens again", || rig.mic.log.lock().unwrap().opened >= 2);
+        assert_eq!(rig.mic.log.lock().unwrap().overlap, 0);
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        assert!(log.contains("\"resumed\""), "{log}");
+    }
+
+    #[test]
+    fn several_notes_in_a_row_keep_the_detector_listening() {
+        // The bug: after a few notes the microphone went quiet and the wake word stayed dead. The
+        // cycle is the fix (S2-S6) and this is the test that holds it: three notes, in a row, with
+        // the detector listening again after each one and never two captures open at once (S7).
+        let rig = wake_rig("cycle", true);
+        rig.recognizer.saying_each(&[" uno ", " dos ", " tres "]);
+        rig.wake.set(true).unwrap();
+
+        for round in 0..3 {
+            // The detector hears the phrase on the capture it already owns.
+            rig.detector.detect(0.6);
+            rig.mic.sink().audio(&[0.2; 480]);
+            wait_until("the note starts", || rig.mic.log.lock().unwrap().opened == 2 + 2 * round);
+
+            // The note records, then ends by itself on silence.
+            let note = rig.mic.sink();
+            for _ in 0..20 {
+                note.audio(&[0.05; 1_600]);
+            }
+            for _ in 0..16 {
+                note.audio(&[0.0; 1_600]);
+            }
+            let listening_again = 3 + 2 * round;
+            wait_until("the detector listens again", || rig.mic.log.lock().unwrap().opened == listening_again);
+            assert!(rig.wake.status().enabled, "the switch never turns itself off");
+        }
+
+        // One line per transition, per note (S6).
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        let lines: Vec<serde_json::Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        for event in ["paused", "note_started", "note_stopped", "resumed"] {
+            let seen = lines.iter().filter(|line| line["event"] == serde_json::json!(event)).count();
+            assert_eq!(seen, 3, "{event} is logged once per note");
+        }
+        assert_eq!(
+            lines.iter().filter(|line| line["event"] == serde_json::json!("resume_failed")).count(),
+            0,
+            "no resume is lost, so nothing is deferred"
+        );
+
+        // Each note carried the text it was given, in order.
+        let transcripts: Vec<_> = rig
+            .recorder
+            .seen()
+            .into_iter()
+            .filter(|event| matches!(event, VoiceEvent::Transcript(_)))
+            .collect();
+        assert_eq!(
+            transcripts,
+            vec![
+                VoiceEvent::Transcript("uno".into()),
+                VoiceEvent::Transcript("dos".into()),
+                VoiceEvent::Transcript("tres".into()),
+            ]
+        );
+
+        // And the invariant: the captures alternate, they never overlap (S5).
+        let mic = rig.mic.log.lock().unwrap();
+        assert_eq!(mic.overlap, 0, "two captures were open at once: {:?}", mic.history);
+        assert_eq!(mic.history.iter().filter(|step| **step == "open").count(), 7);
+        assert_eq!(mic.history.iter().filter(|step| **step == "close").count(), 6, "the detector still owns the microphone");
     }
 
     #[test]
