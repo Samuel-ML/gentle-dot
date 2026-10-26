@@ -645,11 +645,18 @@ impl Wake {
     fn stop(&self) {
         if let Some(voice) = &self.inner.voice {
             match voice.stop() {
-                Ok(transcript) if !transcript.text.is_empty() => {
-                    (self.inner.events)(VoiceEvent::Transcript(transcript.text))
+                // Always, empty included: the panel shows a note nobody started, so it has no reply
+                // to wait for and stays in "recording" forever if this event never arrives. An empty
+                // transcript is how a silent capture ends, and the panel already knows what to do
+                // with it.
+                Ok(transcript) => (self.inner.events)(VoiceEvent::Transcript(transcript.text)),
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.log("failed", serde_json::json!({ "reason": reason }));
+                    // A note that could not be stopped still has to leave the panel's recording
+                    // state, or the same freeze follows.
+                    (self.inner.events)(VoiceEvent::Transcript(String::new()));
                 }
-                Ok(_) => {}
-                Err(error) => self.log("failed", serde_json::json!({ "reason": error.to_string() })),
             }
         }
         // The note's capture is closed here; the detector takes the microphone back next (S4).
@@ -1294,6 +1301,33 @@ mod tests {
             rig.recorder.seen().iter().any(|event| matches!(event, VoiceEvent::Transcript(_)))
         });
         assert_eq!(rig.chime.count(), 1, "the end of the note is silent");
+    }
+
+    #[test]
+    fn a_note_that_hears_no_speech_still_tells_the_panel_it_ended() {
+        // The freeze the user hit: a note nobody pressed the button for has no reply to wait for,
+        // so the panel is only told by an event. A silent note ends with an empty transcript, and
+        // while that event was skipped the panel stayed in "recording" with a stopped timer and
+        // dead buttons. It is always sent now.
+        let rig = wake_rig("empty", true);
+        rig.wake.set(true).unwrap();
+        rig.detector.detect(0.6);
+        rig.mic.sink().audio(&[0.2; 480]);
+        wait_until("the note starts", || rig.mic.log.lock().unwrap().opened == 2);
+        // Speech, then silence: the auto-stop ends it with nothing recognized.
+        let sink = rig.mic.sink();
+        // A second of speech first: the auto-stop only counts silence after real speech.
+        for _ in 0..20 {
+            sink.audio(&[0.05; 1_600]);
+        }
+        for _ in 0..16 {
+            sink.audio(&[0.0; 1_600]);
+        }
+        wait_until("the panel is told the note ended", || {
+            rig.recorder.seen().iter().any(|event| matches!(event, VoiceEvent::Transcript(_)))
+        });
+        let told = rig.recorder.seen().into_iter().find(|event| matches!(event, VoiceEvent::Transcript(_)));
+        assert_eq!(told, Some(VoiceEvent::Transcript(String::new())));
     }
 
     #[test]
