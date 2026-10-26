@@ -24,6 +24,12 @@ use std::sync::{Arc, Mutex};
 const RETRY_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
 
+/// How long a note the wake word started may hold the microphone. The auto-stop counts the audio it
+/// receives, so a capture that delivers none would never end, and the detector would stay paused
+/// with the switch still on: the wall clock ends it instead (S1, S4).
+const NOTE_DEADLINE_MS: u64 = 65_000;
+
+
 /// The commands, as registered in `build.rs` and granted to the panel.
 pub const COMMANDS: [&str; 13] = [
     "voice_status",
@@ -172,12 +178,22 @@ impl VoiceInput {
 
     pub fn stop(&self) -> Result<Transcript, VoiceError> {
         let stopped = self.voice()?.stop();
+        if let Some(wake) = &self.wake {
+            if wake.enabled() {
+                wake.note_ended_by_panel();
+            }
+        }
         self.listen_again();
         stopped
     }
 
     pub fn cancel(&self) -> Result<(), VoiceError> {
         let cancelled = self.voice()?.cancel();
+        if let Some(wake) = &self.wake {
+            if wake.enabled() {
+                wake.note_ended_by_panel();
+            }
+        }
         self.listen_again();
         cancelled
     }
@@ -263,6 +279,10 @@ struct WakeInner {
     device: Mutex<Option<String>>,
     /// Bumped whenever the switch changes, so a retry scheduled for an older state stops.
     generation: AtomicU64,
+    /// The deadline's own clock, in milliseconds (S4).
+    deadline_ms: std::sync::atomic::AtomicU64,
+    /// Counts the notes the detector started, so a deadline only ends the note it was started for.
+    notes: AtomicU64,
     /// What the detector listens for; the panel may change it (S30.7).
     phrase: Mutex<wake::Phrase>,
     /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
@@ -281,6 +301,8 @@ impl Wake {
                 events,
                 enabled: Mutex::new(false),
                 device: Mutex::new(config.voice_input.as_ref().map(|input| input.uid.clone())),
+                deadline_ms: std::sync::atomic::AtomicU64::new(NOTE_DEADLINE_MS),
+                notes: AtomicU64::new(0),
                 phrase: Mutex::new(wake::Phrase::typed(&config.wake_phrase)),
                 generation: AtomicU64::new(0),
                 failure: Mutex::new(None),
@@ -559,6 +581,9 @@ impl Wake {
         // The panel did not press anything, so it needs to know a note is running (S3).
         (self.inner.events)(VoiceEvent::Started);
         self.log("note_started", serde_json::json!({}));
+        // A note that hears nothing never reaches the auto-stop; this ends it anyway (S4).
+        let mine = self.inner.notes.fetch_add(1, Ordering::SeqCst) + 1;
+        self.end_after_deadline(mine);
         Ok(())
     }
 
@@ -577,6 +602,37 @@ impl Wake {
         // The note's capture is closed here; the detector takes the microphone back next (S4).
         self.log("note_stopped", serde_json::json!({}));
         self.resume();
+    }
+
+    /// Ends the note `mine` if it is still the one running when the deadline passes.
+    fn end_after_deadline(&self, mine: u64) {
+        let delegate = self.clone();
+        let wait = std::time::Duration::from_millis(self.inner.deadline_ms.load(Ordering::SeqCst));
+        let spawned = std::thread::Builder::new().name("wake-deadline".into()).spawn(move || {
+            std::thread::sleep(wait);
+            if delegate.inner.notes.load(Ordering::SeqCst) != mine {
+                return;
+            }
+            let Some(voice) = delegate.inner.voice.clone() else { return };
+            if !voice.recording() {
+                return;
+            }
+            delegate.log("note_deadline", serde_json::json!({ "after_ms": wait.as_millis() as u64 }));
+            delegate.stop();
+        });
+        if spawned.is_err() {
+            self.log("failed", serde_json::json!({ "reason": "the note's deadline could not start" }));
+        }
+    }
+
+    /// The deadline, shortened so a test does not wait a minute for it (S4).
+    pub fn set_note_deadline(&self, deadline: std::time::Duration) {
+        self.inner.deadline_ms.store(deadline.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// A note the panel ended, so the cycle has a line for it too (S6).
+    pub fn note_ended_by_panel(&self) {
+        self.log("note_stopped", serde_json::json!({ "from": "panel" }));
     }
 
     fn listen_events(&self) -> ListenEvents {
@@ -1113,6 +1169,25 @@ mod tests {
         assert_eq!(transcript, Some(VoiceEvent::Transcript("hola".into())));
         // And the phrase is waited for again, on a capture of its own.
         wait_until("the detector listens again", || rig.mic.log.lock().unwrap().opened == 3);
+    }
+
+    #[test]
+    fn a_note_that_hears_nothing_ends_itself_and_gives_the_detector_back() {
+        // The other half of "the microphone goes quiet": the auto-stop counts the audio the note
+        // receives, so a capture that delivers none never ends the note, the microphone stays with
+        // it and the detector stays paused with the switch still on. The wall clock ends it (S4).
+        let rig = wake_rig("deaf", true);
+        rig.wake.set(true).unwrap();
+        rig.wake.set_note_deadline(Duration::from_millis(60));
+        rig.detector.detect(0.6);
+        rig.mic.sink().audio(&[0.2; 480]);
+        wait_until("the note starts", || rig.mic.log.lock().unwrap().opened == 2);
+        // The note is given no audio at all, and the deadline still ends it.
+        wait_until("the detector listens again", || rig.mic.log.lock().unwrap().opened == 3);
+        assert_eq!(rig.mic.log.lock().unwrap().overlap, 0);
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
+        assert!(log.contains("\"note_deadline\""), "{log}");
+        assert!(log.contains("\"note_stopped\""), "{log}");
     }
 
     #[test]

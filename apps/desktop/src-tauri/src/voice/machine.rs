@@ -73,6 +73,10 @@ struct Inner {
     changed: Condvar,
     /// Ids the listener's audio is checked against, so audio from a closed listener is ignored.
     next_listen: AtomicU64,
+    /// When the detector last received audio, in milliseconds. A capture can stay open and deliver
+    /// nothing (a Bluetooth headset that slept, a device that went away), and that is invisible
+    /// without this: the detector looks armed and hears nothing (S1).
+    last_frame_ms: AtomicU64,
 }
 
 enum State {
@@ -231,6 +235,14 @@ fn armed(inner: &Inner, id: u64) -> bool {
     matches!(&*lock(&inner.state), State::Idle { armed: Some(armed), .. } if armed.id == id && armed.stream.is_some())
 }
 
+/// Milliseconds since the epoch, for the detector's audio clock.
+fn millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -267,6 +279,7 @@ impl Voice {
             state: Mutex::new(State::Idle { next: 0, armed: None }),
             changed: Condvar::new(),
             next_listen: AtomicU64::new(0),
+            last_frame_ms: AtomicU64::new(0),
         };
         Voice { inner: Arc::new(inner), final_timeout: FINAL_TIMEOUT }
     }
@@ -357,6 +370,7 @@ impl Voice {
             if !armed(&inner, id) {
                 return;
             }
+            inner.last_frame_ms.store(millis(), Ordering::SeqCst);
             let Some(detection) = wake.accept(samples) else { return };
             if !armed(&inner, id) {
                 return;
@@ -370,6 +384,18 @@ impl Voice {
     pub fn with_final_timeout(mut self, timeout: Duration) -> Self {
         self.final_timeout = timeout;
         self
+    }
+
+    /// When the detector last received audio, in milliseconds since the epoch: `0` means the
+    /// capture is open but nothing ever arrived (S1).
+    pub fn last_frame_ms(&self) -> u64 {
+        self.inner.last_frame_ms.load(Ordering::SeqCst)
+    }
+
+    /// Whether a note is running right now (S4): the wake word's deadline needs it to know the
+    /// microphone is still held by a recording.
+    pub fn recording(&self) -> bool {
+        matches!(&*lock(&self.inner.state), State::Recording(_) | State::Stopping(_))
     }
 
     /// Whether voice input can work, without prompting: a permission the user denied, or no
