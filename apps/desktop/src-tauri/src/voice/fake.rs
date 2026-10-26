@@ -34,6 +34,12 @@ pub struct MicLog {
     pub requests: usize,
     pub opened: usize,
     pub closed: usize,
+    /// Every open and close in order, so a test can read the capture cycle instead of guessing.
+    pub history: Vec<&'static str>,
+    /// How many times a capture opened while another was still open (S5: it must never happen).
+    pub overlap: usize,
+    /// One sink per capture, oldest first: audio for the detector stays reachable after a note.
+    pub sinks: Vec<AudioSink>,
     /// The device each capture was asked for; `None` is the system default input.
     pub devices: Vec<Option<String>>,
     pub sink: Option<AudioSink>,
@@ -100,7 +106,13 @@ impl Microphone for FakeMicrophone {
         }
         let mut log = self.log.lock().unwrap();
         log.opened += 1;
+        // Two captures open at once is the bug this app must never have (S5).
+        if log.opened > log.closed + 1 {
+            log.overlap += 1;
+        }
+        log.history.push("open");
         log.devices.push(device.map(str::to_string));
+        log.sinks.push(sink.clone());
         log.sink = Some(sink);
         Ok(Box::new(FakeStream { log: self.log.clone() }))
     }
@@ -112,7 +124,9 @@ struct FakeStream {
 
 impl Stream for FakeStream {
     fn close(&mut self) {
-        self.log.lock().unwrap().closed += 1;
+        let mut log = self.log.lock().unwrap();
+        log.closed += 1;
+        log.history.push("close");
     }
 }
 
@@ -136,6 +150,8 @@ pub struct FakeRecognizer {
     /// Delivered through the sink when the recognition is finished; none plays a recognizer
     /// that never answers.
     pub final_text: Mutex<Option<String>>,
+    /// One text per note, handed out in order, for a test that runs several notes.
+    pub queued_texts: Mutex<Vec<String>>,
     /// Reported as a failure when the recognition is finished.
     pub fail_on_finish: Mutex<Option<String>>,
     /// Plays a recognizer that takes the device's own audio (as Apple Speech does).
@@ -151,6 +167,7 @@ impl FakeRecognizer {
             current: "en_US".into(),
             supported: vec!["en-US".into(), "es-ES".into(), "es-MX".into()],
             final_text: Mutex::new(None),
+            queued_texts: Mutex::new(Vec::new()),
             fail_on_finish: Mutex::new(None),
             native: false,
             log: Arc::default(),
@@ -166,6 +183,13 @@ impl FakeRecognizer {
 
     pub fn sink(&self) -> Sink {
         self.log.lock().unwrap().sink.clone().expect("a recognition began")
+    }
+
+    /// The transcript each of the next notes gets, in order (S7).
+    pub fn saying_each(&self, texts: &[&str]) {
+        let mut queued = self.queued_texts.lock().unwrap();
+        queued.clear();
+        queued.extend(texts.iter().map(|text| (*text).to_string()));
     }
 }
 
@@ -193,7 +217,14 @@ impl Recognizer for FakeRecognizer {
         let mut log = self.log.lock().unwrap();
         log.locales.push(locale.into());
         log.sink = Some(sink.clone());
-        let final_text = self.final_text.lock().unwrap().clone();
+        let final_text = self.final_text.lock().unwrap().clone().or_else(|| {
+            let mut queued = self.queued_texts.lock().unwrap();
+            if queued.is_empty() {
+                None
+            } else {
+                Some(queued.remove(0))
+            }
+        });
         let failure = self.fail_on_finish.lock().unwrap().clone();
         Ok(Box::new(FakeRecognition { log: self.log.clone(), sink, final_text, failure, native: self.native }))
     }

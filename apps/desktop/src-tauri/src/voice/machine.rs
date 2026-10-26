@@ -78,6 +78,9 @@ struct Inner {
 enum State {
     /// Nothing is recording. `armed` is the wake word's listener, when one is waiting.
     Idle { next: u64, armed: Option<Armed> },
+    /// A capture is being closed on the caller's thread. Both `arm` and `begin` refuse it, so no
+    /// capture is ever opened while another closes (S5).
+    Closing { next: u64 },
     Starting { recording: u64, cancelled: bool, failure: Option<String> },
     Recording(Session),
     Stopping(Session),
@@ -191,7 +194,7 @@ impl Feed {
 impl State {
     fn recording(&self) -> Option<u64> {
         match self {
-            State::Idle { .. } => None,
+            State::Idle { .. } | State::Closing { .. } => None,
             State::Starting { recording, .. } => Some(*recording),
             State::Recording(session) | State::Stopping(session) => Some(session.recording),
         }
@@ -310,12 +313,37 @@ impl Voice {
 
     /// Stops waiting for the wake word; harmless when it is not listening.
     pub fn disarm(&self) {
-        let armed = {
+        let Some(armed) = self.take_armed() else { return };
+        self.close_then_idle(armed);
+    }
+
+    /// Whether a wake-word capture is open right now (S1, S6): the app logs a resume only when the
+    /// detector is really listening again, not when the call merely returned.
+    pub fn listening(&self) -> bool {
+        matches!(&*lock(&self.inner.state), State::Idle { armed: Some(armed), .. } if armed.stream.is_some())
+    }
+
+    /// Takes the listener out of the idle state so its capture can be closed outside the lock.
+    fn take_armed(&self) -> Option<Armed> {
+        let mut state = lock(&self.inner.state);
+        let State::Idle { armed, .. } = &mut *state else { return None };
+        armed.take()
+    }
+
+    /// Closes a listener's capture as its own phase: while it runs the machine answers `Busy`, so
+    /// no other capture can be opened beside the one being closed (S5). Synchronous on purpose —
+    /// `Stream::close` is the only completion point there is, and every caller is off the audio
+    /// thread.
+    fn close_then_idle(&self, armed: Armed) {
+        let next = {
             let mut state = lock(&self.inner.state);
-            let State::Idle { armed, .. } = &mut *state else { return };
-            armed.take()
+            let State::Idle { next, .. } = &mut *state else { return };
+            let next = *next;
+            *state = State::Closing { next };
+            next
         };
-        close_listener(armed);
+        close_listener(Some(armed));
+        *lock(&self.inner.state) = State::Idle { next, armed: None };
     }
 
     /// The detector's end of the capture: it runs on the audio thread, so it only matches, and
@@ -376,20 +404,22 @@ impl Voice {
 
     fn begin(&self, requested: Option<&str>, device: Option<&str>, events: Events, woken: Option<Woken>) -> Result<(), VoiceError> {
         self.disarm();
-        let (recording, previous) = {
+        // An arm that landed since `disarm` is closed as its own phase before the note's capture
+        // opens, and a listener still opening refuses the note instead of opening the device twice.
+        match self.take_armed() {
+            Some(previous) => self.close_then_idle(previous),
+            None => {}
+        }
+        let recording = {
             let mut state = lock(&self.inner.state);
             let State::Idle { next, armed } = &mut *state else { return Err(VoiceError::Busy) };
-            // A listener still opening would open the device a second time.
             if armed.as_ref().is_some_and(|armed| armed.stream.is_none()) {
                 return Err(VoiceError::Busy);
             }
-            // An arm that landed since `disarm` is closed outside the lock, not dropped in it.
-            let previous = armed.take();
-            let next = *next;
-            *state = State::Starting { recording: next, cancelled: false, failure: None };
-            (next, previous)
+            let recording = *next;
+            *state = State::Starting { recording, cancelled: false, failure: None };
+            recording
         };
-        close_listener(previous);
         let sink = Sink { inner: Arc::downgrade(&self.inner), recording };
         let begun = self.prepare(requested, recording).and_then(|locale| {
             let mut recognition = self.inner.recognizer.begin(&locale, sink.clone())?;
@@ -509,7 +539,8 @@ impl Voice {
     pub fn cancel(&self) -> Result<(), VoiceError> {
         let mut state = lock(&self.inner.state);
         match &mut *state {
-            State::Idle { .. } => Ok(()),
+            // A close in flight finishes on its own thread; nothing is recording to cancel.
+            State::Idle { .. } | State::Closing { .. } => Ok(()),
             State::Starting { cancelled, .. } => {
                 *cancelled = true;
                 Ok(())
