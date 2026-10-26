@@ -29,6 +29,10 @@ use tauri::{AppHandle, Emitter, EventTarget, Manager};
 /// with the switch still on: the wall clock ends it instead (S1, S4).
 const NOTE_DEADLINE_MS: u64 = 65_000;
 
+/// How long a note may spend starting before it is treated as stalled (S1, S4): a Bluetooth input
+/// whose engine never delivers leaves the machine in `Starting` and the detector paused.
+const STALL_MS: u64 = 3_000;
+
 
 /// The commands, as registered in `build.rs` and granted to the panel.
 pub const COMMANDS: [&str; 13] = [
@@ -583,6 +587,7 @@ impl Wake {
         self.log("note_started", serde_json::json!({}));
         // A note that hears nothing never reaches the auto-stop; this ends it anyway (S4).
         let mine = self.inner.notes.fetch_add(1, Ordering::SeqCst) + 1;
+        self.end_after_stall(mine);
         self.end_after_deadline(mine);
         Ok(())
     }
@@ -604,6 +609,31 @@ impl Wake {
         self.resume();
     }
 
+    /// Ends a start that never became a recording, which is what a sleeping headset looks like:
+    /// the capture opens, the engine never delivers, and the detector stays paused (S1, S4).
+    fn end_after_stall(&self, mine: u64) {
+        let delegate = self.clone();
+        let spawned = std::thread::Builder::new().name("wake-stall".into()).spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(STALL_MS));
+            if delegate.inner.notes.load(Ordering::SeqCst) != mine {
+                return;
+            }
+            let Some(voice) = delegate.inner.voice.clone() else { return };
+            if !voice.starting() {
+                return;
+            }
+            delegate.log("note_stalled", serde_json::json!({ "after_ms": STALL_MS }));
+            delegate.log("note_stopped", serde_json::json!({ "from": "stalled" }));
+            if let Err(error) = voice.cancel() {
+                delegate.log("failed", serde_json::json!({ "reason": error.to_string() }));
+            }
+            delegate.resume();
+        });
+        if spawned.is_err() {
+            self.log("failed", serde_json::json!({ "reason": "the note's stall check could not start" }));
+        }
+    }
+
     /// Ends the note `mine` if it is still the one running when the deadline passes.
     fn end_after_deadline(&self, mine: u64) {
         let delegate = self.clone();
@@ -614,7 +644,18 @@ impl Wake {
                 return;
             }
             let Some(voice) = delegate.inner.voice.clone() else { return };
-            if !voice.recording() {
+            if !voice.busy() {
+                return;
+            }
+            // A start that never became a recording is the Bluetooth stall: nothing was captured,
+            // so it is cancelled instead of stopped, and the detector takes the microphone back.
+            if voice.starting() {
+                delegate.log("note_stalled", serde_json::json!({ "after_ms": wait.as_millis() as u64 }));
+                delegate.log("note_stopped", serde_json::json!({ "from": "stalled" }));
+                if let Err(error) = voice.cancel() {
+                    delegate.log("failed", serde_json::json!({ "reason": error.to_string() }));
+                }
+                delegate.resume();
                 return;
             }
             delegate.log("note_deadline", serde_json::json!({ "after_ms": wait.as_millis() as u64 }));

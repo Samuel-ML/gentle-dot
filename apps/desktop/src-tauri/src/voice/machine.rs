@@ -394,6 +394,18 @@ impl Voice {
 
     /// Whether a note is running right now (S4): the wake word's deadline needs it to know the
     /// microphone is still held by a recording.
+    /// Whether a start is in flight and has not become a recording yet: on a flaky input (a
+    /// Bluetooth headset that sleeps) the capture can open and never finish starting, and the
+    /// machine would otherwise look idle while it holds the microphone.
+    pub fn starting(&self) -> bool {
+        matches!(&*lock(&self.inner.state), State::Starting { .. })
+    }
+
+    /// Whether the microphone is held at all: recording, stopping, or still starting.
+    pub fn busy(&self) -> bool {
+        self.recording() || self.starting()
+    }
+
     pub fn recording(&self) -> bool {
         matches!(&*lock(&self.inner.state), State::Recording(_) | State::Stopping(_))
     }
