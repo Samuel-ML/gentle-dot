@@ -17,6 +17,9 @@ pub struct DesktopConfig {
     /// Whether the wake word listens (S1, S30.7). Off until the user turns it on in Settings, and
     /// only then does the detector ever run.
     pub wake_word: bool,
+    /// The words the detector listens for, editable in Settings so a phrase can be tried before
+    /// it is worth training anything (S30.7).
+    pub wake_phrase: String,
 }
 
 /// The microphone chosen in Settings (S4): the CoreAudio UID is the identity, the name is for
@@ -81,7 +84,9 @@ pub fn parse_config(
         (!uid.is_empty() && !name.is_empty()).then(|| VoiceInput { uid: uid.to_string(), name: name.to_string() })
     });
     let wake_word = file["wake_word"].as_bool().unwrap_or(false);
-    DesktopConfig { data_dir, port, shortcut, voice_input, wake_word }}
+    // An empty or missing phrase is the default: listening for nothing would be worse.
+    let wake_phrase = file["wake_phrase"].as_str().map(str::trim).filter(|text| !text.is_empty()).unwrap_or(DEFAULT_WAKE_PHRASE).to_string();
+    DesktopConfig { data_dir, port, shortcut, voice_input, wake_word, wake_phrase }}
 
 /// HOME keeps precedence on every platform; USERPROFILE is a Windows-only fallback.
 /// Pure so profile selection can be checked without reading a real user's environment.
@@ -101,6 +106,22 @@ pub fn load_config() -> DesktopConfig {
     let dir = data_dir(env, &home);
     let file = std::fs::read_to_string(dir.join("config.json")).ok();
     parse_config(dir, file.as_deref(), env)
+}
+
+/// The phrase the detector listens for until the user types another one.
+pub const DEFAULT_WAKE_PHRASE: &str = "oye Doti";
+
+/// What the panel may type as a phrase: one to four words of letters and digits, each at least
+/// two characters. Long phrases are a paragraph, and one-letter words are noise.
+pub fn valid_wake_phrase(text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let shaped = (1..=4).contains(&words.len())
+        && words.iter().all(|word| word.chars().count() >= 2 && word.chars().all(|c| c.is_alphanumeric()));
+    if !shaped {
+        return Err("Type one to four words, letters and numbers only, two characters or more each.".to_string());
+    }
+    Ok(trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 pub const INVALID_CONFIG: &str =
@@ -169,6 +190,31 @@ pub fn with_wake_word(file: Option<&str>, wake_word: bool) -> Result<String, Str
     json["wake_word"] = wake_word.into();
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     Ok(text + "\n")
+}
+
+/// The text of `config.json` with the phrase set and every other key kept (S30.7).
+pub fn with_wake_phrase(file: Option<&str>, phrase: &str) -> Result<String, String> {
+    let mut json = match file {
+        Some(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .ok_or(INVALID_CONFIG)?,
+        None => serde_json::json!({}),
+    };
+    json["wake_phrase"] = phrase.into();
+    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    Ok(text + "\n")
+}
+
+/// Saves the phrase in `config.json`, privately and in place like every other key.
+pub fn save_wake_phrase(path: &Path, phrase: &str) -> Result<(), String> {
+    let file = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Gentle Dot cannot read config.json ({error}), so the phrase was not saved.")),
+    };
+    let text = with_wake_phrase(file.as_deref(), phrase)?;
+    write_private(path, &text).map_err(|error| format!("Gentle Dot cannot save config.json ({error})."))
 }
 
 /// Saves the wake word's flag in `config.json`, the way the shortcut is saved (S33.3): one key
@@ -275,6 +321,7 @@ mod tests {
                 shortcut: DEFAULT_SHORTCUT.into(),
                 voice_input: None,
                 wake_word: false,
+                wake_phrase: DEFAULT_WAKE_PHRASE.into(),
             }
         );    }
 
@@ -347,6 +394,7 @@ mod tests {
                 shortcut: "Shift+Super+K".into(),
                 voice_input: None,
                 wake_word: false,
+                wake_phrase: DEFAULT_WAKE_PHRASE.into(),
             }
         );        let config = parse_config(dir(), Some(&text), env_of(&[("GENTLE_DOT_PORT", "6000")]));
         assert_eq!(config.port, 6000);
@@ -410,6 +458,30 @@ mod tests {
         assert_eq!(parse_config(dir, Some(&saved), env_of(&[])).voice_input, None);
         // A file that is not JSON is refused, as for every other key.
         assert_eq!(with_voice_input(Some("{ not json"), None), Err(INVALID_CONFIG.to_string()));
+    }
+
+    #[test]
+    fn a_typed_phrase_is_one_to_four_words() {
+        assert_eq!(valid_wake_phrase("  oye   Doti "), Ok("oye Doti".to_string()));
+        assert_eq!(valid_wake_phrase("hey dot"), Ok("hey dot".to_string()));
+        assert!(valid_wake_phrase("").is_err(), "nothing to listen for");
+        assert!(valid_wake_phrase("o").is_err(), "one letter is not a word");
+        assert_eq!(valid_wake_phrase("oye"), Ok("oye".to_string()), "one word is enough");
+        assert!(valid_wake_phrase("oye doti ahora mismo ya").is_err(), "five words is a paragraph");
+        assert!(valid_wake_phrase("oye, doti").is_err(), "punctuation is not a word");
+    }
+
+    #[test]
+    fn the_phrase_survives_a_read_and_a_write() {
+        assert_eq!(parse_config(dir(), None, env_of(&[])).wake_phrase, DEFAULT_WAKE_PHRASE);
+        let text = with_wake_phrase(Some(r#"{ "port": 5000, "wake_word": true }"#), "hey dot").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["wake_phrase"], "hey dot");
+        assert_eq!(json["port"], 5000);
+        assert_eq!(json["wake_word"], true, "the other keys stay");
+        assert_eq!(parse_config(dir(), Some(&text), env_of(&[])).wake_phrase, "hey dot");
+        // An empty one in the file reads as the default, never as silence.
+        assert_eq!(parse_config(dir(), Some(r#"{ "wake_phrase": "  " }"#), env_of(&[])).wake_phrase, DEFAULT_WAKE_PHRASE);
     }
 
     #[test]

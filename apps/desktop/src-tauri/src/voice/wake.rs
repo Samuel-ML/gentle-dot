@@ -130,18 +130,65 @@ pub const HOP: usize = SAMPLE_RATE as usize / 2;
 /// The phrase is two words: "oye" and the name "Doti". Only the opener the user chose counts —
 /// there is no "hola doti" and no "hey doti" — while the name takes every spelling the recogniser
 /// writes for it. Accents are stripped before matching, so "oye dót" arrives here as "dot".
-const OPENERS: [&str; 1] = ["oye"];
-const NAMES: [&str; 5] = ["doti", "doty", "dottie", "dotti", "dot"];
+/// The words the detector listens for, normalised once: the panel may type any phrase, so the
+/// rule cannot be a table of spellings (S30.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phrase {
+    /// What the panel shows and the log records: the typed phrase, trimmed and single-spaced.
+    pub text: String,
+    /// The same words, folded for matching.
+    words: Vec<String>,
+}
 
-/// The variant a transcript says, or none. Pure, so the rule is tested without a model or a mic.
-/// The pair may sit anywhere in the window: "bueno, oye doti" is the command too.
-pub fn says_wake_word(transcript: &str) -> Option<String> {
-    let text = normalised(transcript);
-    let words: Vec<&str> = text.split_whitespace().collect();
-    words
-        .windows(2)
-        .find(|pair| OPENERS.contains(&pair[0]) && NAMES.contains(&pair[1]))
-        .map(|pair| pair.join(" "))
+impl Phrase {
+    /// The phrase as typed, or the default when it is not usable.
+    pub fn typed(text: &str) -> Self {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words: Vec<String> = normalised(&text).split_whitespace().map(folded).collect();
+        if words.is_empty() {
+            return Phrase::default();
+        }
+        Phrase { text: if text.is_empty() { crate::config::DEFAULT_WAKE_PHRASE.to_string() } else { text }, words }
+    }
+
+    /// The variant a transcript says, or none. The words must appear together, in order, anywhere
+    /// in the window: "bueno, oye doti" is the command too.
+    pub fn said(&self, transcript: &str) -> Option<String> {
+        let text = normalised(transcript);
+        let words: Vec<String> = text.split_whitespace().map(folded).collect();
+        let size = self.words.len();
+        if size == 0 || words.len() < size {
+            return None;
+        }
+        words.windows(size).find(|window| *window == self.words.as_slice()).map(|_| self.text.clone())
+    }
+}
+
+impl Default for Phrase {
+    fn default() -> Self {
+        Phrase::typed(crate::config::DEFAULT_WAKE_PHRASE)
+    }
+}
+
+/// One word folded for comparison: repeated letters collapse ("dottie" → "dotie"), a final "ie"
+/// becomes "i", and "y" is "i", because a recogniser writes the same name several ways.
+fn folded(word: &str) -> String {
+    let mut collapsed = String::with_capacity(word.len());
+    for c in word.chars() {
+        if collapsed.chars().last() != Some(c) {
+            collapsed.push(c);
+        }
+    }
+    let mut folded: String = collapsed.chars().map(|c| if c == 'y' { 'i' } else { c }).collect();
+    if folded.len() > 2 && folded.ends_with("ie") {
+        folded.truncate(folded.len() - 1);
+    }
+    folded
+}
+
+/// Whether a transcript says `phrase`. Kept for the tests and for callers that only need a yes.
+pub fn says_wake_word(transcript: &str, phrase: &Phrase) -> Option<String> {
+    phrase.said(transcript)
 }
 
 /// Lowercase, no accents, punctuation to spaces, single spaces: "Oye,  dót." is "oye dot".
@@ -194,6 +241,8 @@ struct Shared {
     decoding: AtomicBool,
     /// The match a decode left behind, handed over on the next callback.
     pending: Mutex<Option<Detection>>,
+    /// What to listen for, so the panel can change it without a rebuild.
+    phrase: Phrase,
 }
 
 /// Writes one window's transcript to the wake log. Without it a spike that never matches says
@@ -226,7 +275,7 @@ impl Drop for Decoding {
 impl ParakeetWake {
     /// Loads the model in `dir` (seconds, so never on the audio thread). A directory that is not
     /// there is an error the caller shows, never a panic.
-    pub fn load(dir: &Path, log: PathBuf) -> Result<Self, String> {
+    pub fn load(dir: &Path, log: PathBuf, phrase: Phrase) -> Result<Self, String> {
         if !dir.is_dir() {
             return Err(parakeet_missing(dir));
         }
@@ -238,6 +287,7 @@ impl ParakeetWake {
                 buffer: Mutex::new(Vec::new()),
                 decoding: AtomicBool::new(false),
                 pending: Mutex::new(None),
+                phrase,
             }),
         })
     }
@@ -250,6 +300,7 @@ impl ParakeetWake {
             buffer: Mutex::new(Vec::new()),
             decoding: AtomicBool::new(false),
             pending: Mutex::new(None),
+            phrase: Phrase::default(),
         };
         ParakeetWake { shared: Arc::new(shared) }
     }
@@ -264,7 +315,7 @@ impl ParakeetWake {
             // Silence, other words, or a decode that failed: the next window asks again, so a
             // failed decode costs one window and not the listener.
             if let Ok(text) = heard {
-                if let Some(variant) = says_wake_word(&text) {
+                if let Some(variant) = shared.phrase.said(&text) {
                     *lock(&shared.pending) =
                         Some(Detection { name: WAKE_WORD.to_string(), score: 1.0, variant: Some(variant) });
                 }
@@ -492,33 +543,44 @@ mod tests {
 
     #[test]
     fn the_phrase_as_it_is_really_said_matches() {
-        // The spellings the recogniser returns for "oye Doti", plus how a person actually says it
-        // inside a window: the pair anywhere, with punctuation, any casing, accents or not.
-        for (said, variant) in [
-            ("oye doti", "oye doti"),
-            ("Oye Doti", "oye doti"),
-            ("oye doty", "oye doty"),
-            ("oye dottie", "oye dottie"),
-            ("oye dotti", "oye dotti"),
-            ("oye dót", "oye dot"),
-            ("¿oye, doti?", "oye doti"),
-            ("  oye   dottie. ", "oye dottie"),
-            ("bueno, oye doti", "oye doti"),
-            ("oye doti oye", "oye doti"),
+        // The default phrase, in the spellings the recogniser returns for "Doti": doubled
+        // letters, a final "ie" and "y" for "i" all fold to the same word.
+        let phrase = Phrase::typed(crate::config::DEFAULT_WAKE_PHRASE);
+        for said in [
+            "oye doti",
+            "Oye Doti",
+            "oye doty",
+            "oye dottie",
+            "oye dotti",
+            "¿oye, doti?",
+            "  oye   dottie. ",
+            "bueno, oye doti",
+            "oye doti oye",
         ] {
-            assert_eq!(says_wake_word(said).as_deref(), Some(variant), "{said}");
+            assert_eq!(phrase.said(said).as_deref(), Some("oye Doti"), "{said}");
         }
+    }
+
+    #[test]
+    fn another_phrase_is_heard_just_as_well() {
+        // Any phrase the panel types: the rule is the words, not a table of spellings.
+        let phrase = Phrase::typed("hey dot");
+        assert_eq!(phrase.said("Hey, dott.").as_deref(), Some("hey dot"));
+        assert_eq!(phrase.said("hola hey dot"), Some("hey dot".into()));
+        assert_eq!(phrase.said("hey dottie"), None, "one more letter is another word");
+
+        let three = Phrase::typed("atencion asistente ya");
+        assert_eq!(three.said("la atencion asistente ya por favor"), Some("atencion asistente ya".into()));
+        assert_eq!(Phrase::typed("").text, crate::config::DEFAULT_WAKE_PHRASE, "empty falls back");
     }
 
     #[test]
     fn anything_else_is_not_the_phrase() {
         // Only the opener the user chose counts: "hola doti" and "hey doti" are not the phrase, and
         // neither is one word alone or a different name, so a conversation does not start a note.
-        for near in [
-            "", "oye", "doti", "oye punto", "hola doti", "hey doti", "ey doti", "doti oye", "oye dote",
-            "oye dos", "donde esta el doti",
-        ] {
-            assert_eq!(says_wake_word(near), None, "{near}");
+        let phrase = Phrase::typed(crate::config::DEFAULT_WAKE_PHRASE);
+        for near in ["", "oye", "doti", "oye punto", "hola doti", "hey doti", "ey doti", "doti oye", "oye dote"] {
+            assert_eq!(phrase.said(near), None, "{near}");
         }
     }
 
@@ -560,7 +622,7 @@ mod tests {
         while heard.is_none() && std::time::Instant::now() < deadline {
             heard = wake.accept(&[0.0; 160]);
         }
-        assert_eq!(heard, Some(Detection { name: WAKE_WORD.into(), score: 1.0, variant: Some("oye dottie".into()) }));
+        assert_eq!(heard, Some(Detection { name: WAKE_WORD.into(), score: 1.0, variant: Some("oye Doti".into()) }));
     }
 
     #[test]
@@ -576,7 +638,7 @@ mod tests {
     #[test]
     fn a_model_that_is_not_there_is_an_error_not_a_panic() {
         let dir = std::env::temp_dir().join(format!("gentle-dot-no-parakeet-{}", std::process::id()));
-        let error = ParakeetWake::load(&dir, PathBuf::from("/tmp/wake-word-test.log")).err().expect("a missing model is an error");
+        let error = ParakeetWake::load(&dir, PathBuf::from("/tmp/wake-word-test.log"), Phrase::default()).err().expect("a missing model is an error");
         assert!(error.contains(&dir.display().to_string()), "{error}");
     }
 

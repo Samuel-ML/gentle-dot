@@ -25,17 +25,20 @@ const RETRY_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
 
 /// The commands, as registered in `build.rs` and granted to the panel.
-pub const COMMANDS: [&str; 10] = [
+pub const COMMANDS: [&str; 13] = [
     "voice_status",
     "voice_start",
     "voice_stop",
     "voice_cancel",
+    "voice_input_options",
+    "voice_input_set",
     "voice_model_status",
     "voice_model_download",
     "voice_model_cancel",
     "voice_model_remove",
     "wake_word_status",
     "wake_word_set",
+    "wake_phrase_set",
 ];
 
 /// Said when the panel asks to record from a microphone that is not one.
@@ -196,6 +199,11 @@ impl VoiceInput {
     pub fn wake_set(&self, enabled: bool) -> Result<WakeStatus, String> {
         self.wake.as_ref().ok_or_else(|| UNSUPPORTED.to_string())?.set(enabled)
     }
+
+    /// Changes the phrase without touching the switch (S30.7).
+    pub fn wake_phrase_set(&self, phrase: &str) -> Result<WakeStatus, String> {
+        self.wake.as_ref().ok_or_else(|| UNSUPPORTED.to_string())?.set_phrase(phrase)
+    }
 }
 
 /// The `wake_word_status` reply: `{enabled, available, reason?}`.
@@ -203,13 +211,20 @@ impl VoiceInput {
 pub struct WakeStatus {
     pub enabled: bool,
     pub available: bool,
+    /// The phrase in words, as the panel typed it.
+    pub phrase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
 impl WakeStatus {
     fn unavailable(reason: impl Into<String>) -> Self {
-        WakeStatus { enabled: false, available: false, reason: Some(reason.into()) }
+        WakeStatus {
+            enabled: false,
+            available: false,
+            reason: Some(reason.into()),
+            phrase: crate::config::DEFAULT_WAKE_PHRASE.to_string(),
+        }
     }
 }
 
@@ -249,6 +264,8 @@ struct WakeInner {
     device: Mutex<Option<String>>,
     /// Bumped whenever the switch changes, so a retry scheduled for an older state stops.
     generation: AtomicU64,
+    /// What the detector listens for; the panel may change it (S30.7).
+    phrase: Mutex<wake::Phrase>,
     /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
     /// the switch cannot claim to be listening while the microphone is gone (S1).
     failure: Mutex<Option<String>>,
@@ -266,6 +283,7 @@ impl Wake {
                 events,
                 enabled: Mutex::new(false),
                 device: Mutex::new(config.voice_input.as_ref().map(|input| input.uid.clone())),
+                phrase: Mutex::new(wake::Phrase::typed(&config.wake_phrase)),
                 generation: AtomicU64::new(0),
                 failure: Mutex::new(None),
             }),
@@ -299,9 +317,27 @@ impl Wake {
     pub fn status(&self) -> WakeStatus {
         let enabled = self.enabled();
         match self.reason().or_else(|| enabled.then(|| self.failure()).flatten()) {
-            None => WakeStatus { enabled, available: true, reason: None },
-            Some(reason) => WakeStatus { enabled, available: false, reason: Some(reason) },
+            None => WakeStatus { enabled, available: true, reason: None, phrase: self.phrase().text },
+            Some(reason) => WakeStatus { enabled, available: false, reason: Some(reason), phrase: self.phrase().text },
         }
+    }
+
+    /// The phrase the detector is listening for.
+    fn phrase(&self) -> wake::Phrase {
+        self.inner.phrase.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// Stores a new phrase, applies it now and saves it. The detector is rebuilt around it, so
+    /// the change is heard on the next window instead of after a restart (S30.7).
+    pub fn set_phrase(&self, typed: &str) -> Result<WakeStatus, String> {
+        let phrase = wake::Phrase::typed(&crate::config::valid_wake_phrase(typed)?);
+        *self.inner.phrase.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = phrase;
+        crate::config::save_wake_phrase(&self.inner.config_file, crate::config::valid_wake_phrase(typed)?.as_str())?;
+        if self.enabled() {
+            self.disarm();
+            self.resume();
+        }
+        Ok(self.status())
     }
 
     fn generation(&self) -> u64 {
@@ -422,7 +458,7 @@ impl Wake {
         // reference otherwise. Loading either one takes seconds, so this runs off the audio thread.
         let detector = match self.local() {
             Some(dir) => Arc::new(
-                wake::ParakeetWake::load(&dir, self.inner.log.clone()).map_err(VoiceError::Failed)?,
+                wake::ParakeetWake::load(&dir, self.inner.log.clone(), self.phrase()).map_err(VoiceError::Failed)?,
             ) as Arc<dyn WakeWord>,
             None => {
                 let load = self.detector.as_ref().ok_or(VoiceError::Unsupported)?;
@@ -720,6 +756,14 @@ pub async fn wake_word_status(app: AppHandle) -> Result<WakeStatus, String> {
     blocking(app, |input| Ok(input.wake_status())).await
 }
 
+/// Stores the phrase the detector listens for (S30.7): one to four words, applied on the spot.
+#[tauri::command]
+pub async fn wake_phrase_set(app: AppHandle, phrase: String) -> Result<WakeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<VoiceInput>().wake_phrase_set(&phrase))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Turns the wake word on or off (S1). On without the reference fails with the reason.
 #[tauri::command]
 pub async fn wake_word_set(app: AppHandle, enabled: bool) -> Result<WakeStatus, String> {
@@ -792,7 +836,12 @@ mod tests {
         let input = VoiceInput::unsupported();
         assert_eq!(
             input.wake_status(),
-            WakeStatus { enabled: false, available: false, reason: Some(UNSUPPORTED.into()) }
+            WakeStatus {
+                enabled: false,
+                available: false,
+                reason: Some(UNSUPPORTED.into()),
+                phrase: crate::config::DEFAULT_WAKE_PHRASE.into(),
+            }
         );
         assert_eq!(input.wake_set(true), Err(UNSUPPORTED.to_string()));
     }
@@ -806,12 +855,15 @@ mod tests {
                 "voice_start",
                 "voice_stop",
                 "voice_cancel",
+                "voice_input_options",
+                "voice_input_set",
                 "voice_model_status",
                 "voice_model_download",
                 "voice_model_cancel",
                 "voice_model_remove",
                 "wake_word_status",
                 "wake_word_set",
+                "wake_phrase_set",
             ]
         );
     }
@@ -844,7 +896,14 @@ mod tests {
     }
 
     fn config(dir: PathBuf) -> DesktopConfig {
-        DesktopConfig { data_dir: dir, port: 0, shortcut: String::new(), voice_input: None, wake_word: false }
+        DesktopConfig {
+            data_dir: dir,
+            port: 0,
+            shortcut: String::new(),
+            voice_input: None,
+            wake_word: false,
+            wake_phrase: crate::config::DEFAULT_WAKE_PHRASE.into(),
+        }
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -915,12 +974,12 @@ mod tests {
     #[test]
     fn the_wake_word_is_off_until_it_is_turned_on_and_the_flag_is_saved() {
         let rig = wake_rig("on", true);
-        assert_eq!(rig.wake.status(), WakeStatus { enabled: false, available: true, reason: None });
-        assert_eq!(rig.wake.set(true), Ok(WakeStatus { enabled: true, available: true, reason: None }));
+        assert_eq!(rig.wake.status(), WakeStatus { enabled: false, available: true, reason: None, phrase: crate::config::DEFAULT_WAKE_PHRASE.into() });
+        assert_eq!(rig.wake.set(true), Ok(WakeStatus { enabled: true, available: true, reason: None, phrase: crate::config::DEFAULT_WAKE_PHRASE.into() }));
         assert_eq!(rig.mic.log.lock().unwrap().opened, 1, "listening is the only capture");
         let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rig.dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(saved["wake_word"], serde_json::json!(true));
-        assert_eq!(rig.wake.set(false), Ok(WakeStatus { enabled: false, available: true, reason: None }));
+        assert_eq!(rig.wake.set(false), Ok(WakeStatus { enabled: false, available: true, reason: None, phrase: crate::config::DEFAULT_WAKE_PHRASE.into() }));
         assert_eq!(rig.mic.log.lock().unwrap().closed, 1);
         let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rig.dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(saved["wake_word"], serde_json::json!(false));
@@ -949,7 +1008,7 @@ mod tests {
         let locate: Locate = Arc::new(|| Some(PathBuf::from("/models/parakeet-tdt-0.6b-v3-int8")));
         let detector: Load = Arc::new(|_| Ok(Arc::new(FakeWake::default()) as Arc<dyn WakeWord>));
         let wake = Wake::new(Some(voice), &config(dir), Recorder::default().events(), locate).with_detector(detector);
-        assert_eq!(wake.status(), WakeStatus { enabled: false, available: true, reason: None });
+        assert_eq!(wake.status(), WakeStatus { enabled: false, available: true, reason: None, phrase: crate::config::DEFAULT_WAKE_PHRASE.into() });
     }
 
     #[test]

@@ -33,7 +33,7 @@ function reasonOf(error: unknown, fallback = "Gentle Dot could not change the sh
 }
 
 /** The wake word's state (S30.7): whether it is on, and if not, why it cannot be. */
-type WakeWord = { enabled: boolean; available: boolean; reason?: string };
+type WakeWord = { enabled: boolean; available: boolean; reason?: string; phrase?: string };
 
 const NO_WAKE_WORD = "The wake word is not available on this computer.";
 
@@ -44,6 +44,7 @@ async function wakeWordStatus(): Promise<WakeWord> {
 			enabled: status?.enabled === true,
 			available: status?.available === true,
 			reason: typeof status?.reason === "string" ? status.reason : undefined,
+			phrase: typeof status?.phrase === "string" ? status.phrase : undefined,
 		};
 	} catch {
 		return { enabled: false, available: false, reason: NO_WAKE_WORD };
@@ -61,8 +62,20 @@ export function SettingsPanel({ close }: { close: () => void }) {
 	const [language, setLanguage] = useState(() => voiceLanguage() ?? "");
 	const [wake, setWake] = useState<WakeWord | undefined>(undefined);
 	const [wakeError, setWakeError] = useState<string | undefined>(undefined);
+	const [phrase, setPhrase] = useState("");
 	const mac = isMac();
 	const show = (accelerator: string) => formatShortcut(accelerator, mac);
+
+	/** Saves the words the detector listens for, and shows the app's reason when it refuses. */
+	const savePhrase = useCallback(async () => {
+		setWakeError(undefined);
+		try {
+			const status = await invoke<Partial<WakeWord>>("wake_phrase_set", { phrase });
+			if (live.current) setWake({ ...(status as WakeWord) });
+		} catch (error) {
+			if (live.current) setWakeError(wakeWordReason(error));
+		}
+	}, [phrase]);
 	const [info, setInfo] = useState<ShortcutInfo | undefined>(undefined);
 	const [loadFailed, setLoadFailed] = useState(false);
 	const [status, setStatus] = useState<Status>({ kind: "idle" });
@@ -113,7 +126,9 @@ export function SettingsPanel({ close }: { close: () => void }) {
 		if (!isTauri()) return;
 		let live = true;
 		wakeWordStatus().then((found) => {
-			if (live) setWake(found);
+			if (!live) return;
+			setWake(found);
+			setPhrase(found.phrase ?? "");
 		});
 		return () => {
 			live = false;
@@ -314,8 +329,26 @@ export function SettingsPanel({ close }: { close: () => void }) {
 						disabled={wake?.available !== true}
 						onChange={(event) => setWakeWord(event.target.checked)}
 					/>
-					<span>Listen for “oye Doti”</span>
+					<span>Listen for “{wake?.phrase ?? "oye Doti"}”</span>
 				</label>
+				<label className="settings-phrase">
+					<span>Words to listen for</span>
+					<input
+						type="text"
+						aria-label="Words to listen for"
+						value={phrase}
+						maxLength={60}
+						disabled={wake === undefined}
+						onChange={(event) => setPhrase(event.target.value)}
+						onKeyDown={(event) => {
+							if (event.key === "Enter") void savePhrase();
+						}}
+					/>
+				</label>
+				<button type="button" disabled={wake === undefined || phrase === (wake?.phrase ?? "")} onClick={() => void savePhrase()}>
+					Save the words
+				</button>
+				<p className="settings-hint muted">One to four words, two letters or more each. It takes effect on the spot.</p>
 				{wake?.available === false && wake.reason ? (
 					<p className="settings-hint muted">{wake.reason}</p>
 				) : null}
