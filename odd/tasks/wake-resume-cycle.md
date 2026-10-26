@@ -27,9 +27,9 @@ stops working. Fix: one capture at a time, a paused detector, and a resume that 
 
 | ID | Specs | Route | Commit |
 |----|-------|-------|--------|
-| T1 | S2, S5 | `machine.rs`: a `Closing` phase that gates `arm` and `begin`, closed synchronously on the caller's thread, so a capture is never opened while another closes; `stop` on a `Starting` session returns the slot to `Idle` instead of leaving `Starting{cancelled:true}`; a public "is the detector listening" query | — |
-| T2 | S1, S6 | `app.rs`: log `paused`/`note_started`/`note_stopped`/`resumed`, and `resume_failed` with its reason; a note that fails to start re-arms the detector instead of stranding it; a `Busy`/`Cancelled` resume schedules a retry; a watchdog re-arms when enabled and not listening | — |
-| T3 | S7 | `fake.rs` + tests: capture history to prove S5, per-note recognizer text, detector re-arm counter, and the consecutive-notes cycle | — |
+| T1 ✅ `d9390ec` | S2, S5 | `machine.rs`: a `Closing` phase that gates `arm` and `begin`, closed synchronously on the caller's thread, so a capture is never opened while another closes; `stop` on a `Starting` session returns the slot to `Idle` instead of leaving `Starting{cancelled:true}`; a public "is the detector listening" query | — |
+| T2 ✅ `afe8cc1` | S1, S6 | `app.rs`: log `paused`/`note_started`/`note_stopped`/`resumed`, and `resume_failed` with its reason; a note that fails to start re-arms the detector instead of stranding it; a `Busy`/`Cancelled` resume schedules a retry; a watchdog re-arms when enabled and not listening | — |
+| T3 ✅ `afe8cc1` | S7 | `fake.rs` + tests: capture history to prove S5, per-note recognizer text, detector re-arm counter, and the consecutive-notes cycle | — |
 | T4 | S1-S7 | build, install, commit | — |
 
 ## Log
@@ -59,3 +59,17 @@ stops working. Fix: one capture at a time, a paused detector, and a resume that 
   resume (`app.rs:457-463`), which costs seconds of silence per note.
 - L4 — Decision: implement the user's cycle (S2-S7) as the shape of the fix, and close the three
   stranding paths above, because the cycle alone does not remove them.
+- L5 — Implemented. `machine.rs`: `State::Closing { next }` runs `close_listener` synchronously on
+  the caller's thread and both `arm` and `begin` answer `Busy` while it is in flight; `disarm`,
+  `begin` and the late arm inside `begin` all go through it; `Voice::listening()` answers whether a
+  detector capture is open. `app.rs`: `paused`, `note_started`, `note_stopped`, `resumed` and
+  `resume_failed {reason, attempt, retry}` are one JSON line each; a note that fails to start logs
+  `note_failed` and re-arms; a deferred `Busy`/`Cancelled` resume retries instead of assuming
+  another path will; the ladder keeps its slowest step (8 s) instead of giving up, so no single lost
+  resume can leave the detector dead. `fake.rs`: ordered open/close `history`, an `overlap` counter,
+  one `sinks` entry per capture and `saying_each` for one transcript per note.
+- L6 — Evidence: `several_notes_in_a_row_keep_the_detector_listening` runs three notes and asserts
+  three of each transition, no `resume_failed`, the transcripts in order, `overlap == 0` and the
+  capture history (7 opens, 6 closes: the detector still owns the microphone).
+  `a_note_that_never_starts_gives_the_detector_back` is red without the re-arm (`the detector listens
+  again` times out) and green with it, which is the reported bug reproduced.
