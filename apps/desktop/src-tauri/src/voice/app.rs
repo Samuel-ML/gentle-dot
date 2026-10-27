@@ -41,6 +41,9 @@ const CAPTURE_TICK_MS: u64 = 2_000;
 const CAPTURE_SILENT_MS: u64 = 8_000;
 const CAPTURE_RETRIES: usize = 3;
 
+/// How long the supervisor leaves the microphone alone after every input failed to deliver.
+const CAPTURE_HOLD_MS: u64 = 60_000;
+
 /// The last link of the chain: when neither the chosen input nor the system default delivers
 /// anything (a Bluetooth headset that slept, a device that went away), the built-in microphone
 /// keeps the wake word alive. It is named by UID so it is used whether or not it is the default.
@@ -321,6 +324,9 @@ struct WakeInner {
     frames_at_note: AtomicU64,
     /// One supervisor per app, not one per arm: the microphone has a single owner.
     supervising: AtomicBool,
+    /// Until when the supervisor leaves the device alone after every input failed: cycling it is
+    /// worse than waiting for the next note or toggle.
+    hold_until_ms: AtomicU64,
     /// What the detector listens for; the panel may change it (S30.7).
     phrase: Mutex<wake::Phrase>,
     /// Why the last attempt to listen failed, cleared when one succeeds: the panel shows it, so
@@ -349,6 +355,7 @@ impl Wake {
                 note_ms: AtomicU64::new(0),
                 frames_at_note: AtomicU64::new(0),
                 supervising: AtomicBool::new(false),
+                hold_until_ms: AtomicU64::new(0),
                 deadline_ms: std::sync::atomic::AtomicU64::new(NOTE_DEADLINE_MS),
                 notes: AtomicU64::new(0),
                 phrase: Mutex::new(wake::Phrase::typed(&config.wake_phrase)),
@@ -508,9 +515,14 @@ impl Wake {
                 return Err(reason);
             }
             let voice = self.inner.voice.clone().ok_or_else(|| UNSUPPORTED.to_string())?;
-            // The switch says on before the channel opens: the guard that watches that channel
+            // The switch says on before the channel opens: the supervisor that watches that channel
             // starts with the arm and must not see the previous state.
             self.set_enabled(true);
+            // A person asking again is a fresh start: the chain begins at the chosen device.
+            self.inner.silent_attempts.store(0, Ordering::SeqCst);
+            self.inner.force_default.store(false, Ordering::SeqCst);
+            self.inner.use_built_in.store(false, Ordering::SeqCst);
+            self.inner.hold_until_ms.store(0, Ordering::SeqCst);
             if let Err(error) = self.listen(&voice) {
                 self.set_enabled(false);
                 return Err(error.to_string());
@@ -571,7 +583,8 @@ impl Wake {
                 self.log("failed", serde_json::json!({ "step": "arm", "reason": error.to_string() }));
                 // A device that is gone makes the arm fail outright; the built-in takes over so the
                 // switch cannot end up on with nothing listening.
-                if self.fall_back_to_built_in(&error.to_string()) {
+                let device_problem = !matches!(error, VoiceError::Busy | VoiceError::Cancelled);
+                if device_problem && self.fall_back_to_built_in(&error.to_string()) {
                     voice.arm(self.device().as_deref(), detector, self.listen_events())
                 } else {
                     armed
@@ -760,10 +773,16 @@ impl Wake {
                 continue;
             }
             let Some(voice) = delegate.inner.voice.clone() else { continue };
-            if voice.busy() {
+            if voice.recording() || voice.starting() {
                 delegate.watch_note(&voice);
+            } else if voice.busy() {
+                // A capture is still closing on another thread: the microphone is not free yet.
+                continue;
             } else if voice.listening() {
                 delegate.watch_capture(&voice);
+            } else if now_ms() < delegate.inner.hold_until_ms.load(Ordering::SeqCst) {
+                // Every input failed a moment ago; retrying now would only cycle the device.
+                continue;
             } else {
                 // Nothing owns the microphone and nothing is listening: this is the one place that
                 // brings the channel back, whatever the previous actor left behind (S1).
@@ -831,12 +850,21 @@ impl Wake {
             } else if !self.inner.use_built_in.swap(true, Ordering::SeqCst) {
                 self.log("device_fallback", serde_json::json!({ "to": "the built-in microphone", "attempt": attempt }));
             } else {
-                // Every input had its turn: stop cycling the device and wait for the next event.
+                // Every input had its turn. Close the capture instead of leaving it open and mute,
+                // and hold off: the next note, toggle or restart starts a fresh chain.
                 self.log("capture_gave_up", serde_json::json!({ "attempts": attempt }));
+                self.inner.hold_until_ms.store(now_ms() + CAPTURE_HOLD_MS, Ordering::SeqCst);
+                self.disarm();
                 return;
             }
         }
         self.recover();
+    }
+
+    /// The machine under this detector, for a test that needs to press its buttons (T5).
+    #[cfg(test)]
+    pub fn voice(&self) -> Option<Voice> {
+        self.inner.voice.clone()
     }
 
     /// The supervisor's clock and tolerance, shortened so a test does not wait seconds (S1).
@@ -1484,6 +1512,40 @@ mod tests {
         assert!(log.contains("\"capture_lost\""), "{log}");
         assert!(rig.mic.log.lock().unwrap().opened >= 4, "three retries, then the fallback");
         assert!(rig.wake.status().enabled, "the switch never turns itself off");
+    }
+
+    #[test]
+    fn a_busy_machine_is_not_a_device_problem() {
+        // The log repeated `device_fallback {"because":"Voice input is already recording"}`, which
+        // walked the whole chain because the machine was closing a capture, not because the device
+        // had failed. Busy and Cancelled never count as a device failure.
+        let rig = wake_rig("busy", true);
+        rig.wake.set(true).unwrap();
+        // A second arm while the detector holds the microphone answers Busy.
+        let voice = rig.wake.voice().expect("the rig has a machine");
+        assert!(voice.arm(None, std::sync::Arc::new(FakeWake::default()), std::sync::Arc::new(|_| {})).is_err());
+        rig.wake.resume();
+        let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap_or_default();
+        assert!(!log.contains("\"device_fallback\""), "{log}");
+    }
+
+    #[test]
+    fn giving_up_closes_the_capture_and_holds() {
+        // Leaving the dead capture open and mute is the "microphone on, deaf" state. When every
+        // input has had its turn, the supervisor closes it and waits instead of cycling the device.
+        let rig = wake_rig("hold", true);
+        rig.wake.set_capture_guard(Duration::from_millis(5), Duration::from_millis(20));
+        rig.wake.set(true).unwrap();
+        wait_until("the supervisor gives up", || {
+            std::fs::read_to_string(rig.dir.join("wake-word.log")).is_ok_and(|log| log.contains("capture_gave_up"))
+        });
+        wait_until("the capture is closed", || {
+            let mic = rig.mic.log.lock().unwrap();
+            mic.opened == mic.closed
+        });
+        let opened = rig.mic.log.lock().unwrap().opened;
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(rig.mic.log.lock().unwrap().opened, opened, "nothing is reopened while it holds");
     }
 
     #[test]

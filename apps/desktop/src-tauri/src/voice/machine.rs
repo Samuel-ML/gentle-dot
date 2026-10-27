@@ -415,9 +415,16 @@ impl Voice {
         matches!(&*lock(&self.inner.state), State::Starting { .. })
     }
 
-    /// Whether the microphone is held at all: recording, stopping, or still starting.
+    /// A capture is being closed on the caller's thread: the microphone is not free yet, even
+    /// though nothing is recording and nothing is listening.
+    pub fn closing(&self) -> bool {
+        matches!(&*lock(&self.inner.state), State::Closing { .. })
+    }
+
+    /// Whether the microphone is held at all: recording, stopping, starting, or closing. `arm`
+    /// refuses anything but idle, and an arm that answers Busy is not a device problem.
     pub fn busy(&self) -> bool {
-        self.recording() || self.starting()
+        self.recording() || self.starting() || self.closing()
     }
 
     pub fn recording(&self) -> bool {
