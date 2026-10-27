@@ -192,14 +192,15 @@ export function useVoice(state: DotState, send: Send): VoiceControls {
 	/** The input holds dictated text that has not been sent yet. */
 	const dictated = useRef(false);
 
+	/** `always` is the wake word's note: nobody is at the keyboard, so its text is sent, not drafted. */
 	const sendTranscript = useCallback(
-		(transcript: string) => {
+		(transcript: string, always = false) => {
 			const text = transcript.trim();
 			if (!text) {
 				finish(REASONS.empty);
 				return;
 			}
-			if (sendOnStopNow.current) {
+			if (always || sendOnStopNow.current) {
 				voiceTurn.current = new Set(latest.current.messages.map((m) => m.id));
 				send({ type: "send", text, requestId: newRequestId() });
 			} else {
@@ -370,7 +371,8 @@ export function useVoice(state: DotState, send: Send): VoiceControls {
 			started: () => {
 				if (phaseNow.current === "idle") setPhase("recording");
 			},
-			transcript: (text) => sendTranscript(text),
+			// A note the phrase started has no hands on the keyboard: it goes to the chat.
+			transcript: (text) => sendTranscript(text, true),
 			// The backend owns the state; the panel only follows it. A recording phase the backend
 			// no longer reports is over, whatever the panel believed.
 			state: (state) => {
