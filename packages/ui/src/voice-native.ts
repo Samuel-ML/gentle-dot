@@ -90,6 +90,12 @@ export async function onNativeVoice(handlers: NativeVoiceHandlers): Promise<() =
 }
 
 /**
+ * The event the app pushes the whole list on whenever the Mac's devices change (S1, S2): the
+ * panel's microphone picker follows it instead of the snapshot it read when it opened.
+ */
+export const VOICE_DEVICES_EVENT = "voice://devices";
+
+/**
  * The input devices the app offers and the one chosen (S1, S4): the stored identity is the device
  * UID and the name is display only. `chosen` is `null` when following the system default.
  */
@@ -106,9 +112,13 @@ export interface VoiceInputOptions {
 
 /** The devices and the stored choice; a malformed answer reads as no devices yet and the system default. */
 export async function loadVoiceInputOptions(): Promise<VoiceInputOptions> {
-	const answer = await invoke<{ devices?: unknown; chosen?: unknown; default?: unknown } | undefined>(
-		"voice_input_options",
-	);
+	return optionsOf(await invoke<Payload | undefined>("voice_input_options"));
+}
+
+type Payload = { devices?: unknown; chosen?: unknown; default?: unknown };
+
+/** The reply, or the payload the app pushes, read one way: the two are the same shape (S1). */
+function optionsOf(answer: Payload | undefined | null): VoiceInputOptions {
 	const list: unknown[] = Array.isArray(answer?.devices) ? answer.devices : [];
 	const devices: VoiceInputDevice[] = [];
 	for (const entry of list) {
@@ -117,6 +127,15 @@ export async function loadVoiceInputOptions(): Promise<VoiceInputOptions> {
 		devices.push({ uid: device.uid, name: typeof device.name === "string" ? device.name : "" });
 	}
 	return { devices, chosen: deviceId(answer?.chosen), default: deviceId(answer?.default) };
+}
+
+/**
+ * The whole list the app pushes whenever the Mac's devices change (S1, S2): a headset connected,
+ * paired or unplugged re-renders the picker without anything being restarted.
+ */
+export async function onVoiceDevices(handler: (options: VoiceInputOptions) => void): Promise<() => void> {
+	const { listen } = await tauriEvents();
+	return listen<Payload>(VOICE_DEVICES_EVENT, (event) => handler(optionsOf(event.payload)));
 }
 
 /** A device UID the app gave, or `null` (the system default) when it gave none. */

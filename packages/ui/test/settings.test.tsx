@@ -17,6 +17,8 @@ const h = vi.hoisted(() => ({
 	chosen: null as string | null,
 	inputSetResult: undefined as undefined | ((uid: string | null) => Promise<unknown>),
 	invoke: vi.fn(),
+	/** The panel's `listen` calls by event name, so a test can push what the app would (S1). */
+	listeners: new Map<string, (event: { payload: unknown }) => void>(),
 	state: undefined as unknown as DotState,
 }));
 
@@ -26,7 +28,12 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-	listen: async () => () => {},
+	listen: async (name: string, handler: (event: { payload: unknown }) => void) => {
+		h.listeners.set(name, handler);
+		return () => {
+			h.listeners.delete(name);
+		};
+	},
 }));
 
 // As in computer.test.tsx: the panel's other desktop events are not under test.
@@ -58,6 +65,14 @@ async function openSettings() {
 
 const microphoneSection = () => screen.getByRole("region", { name: "Microphone" });
 
+/** The app pushing a list to the panel, the way `voice://devices` does (S1, S2). */
+async function push(name: string, payload: unknown) {
+	await waitFor(() => expect(h.listeners.has(name)).toBe(true));
+	act(() => {
+		h.listeners.get(name)?.({ payload });
+	});
+}
+
 /** The microphone picker, once the app has answered and it stops being disabled. */
 async function openMicrophone() {
 	await openSettings();
@@ -84,6 +99,7 @@ beforeEach(() => {
 	];
 	h.chosen = null;
 	h.inputSetResult = undefined;
+	h.listeners = new Map();
 	h.state = { ...initialState, connection: "open", agentState: "idle" };
 	vi.spyOn(navigator, "userAgent", "get").mockReturnValue(MAC_AGENT);
 	h.invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
@@ -355,6 +371,43 @@ describe("the microphone (S1, S3, S4)", () => {
 		expect(invoked("voice_input_set")).toHaveLength(0);
 		await userEvent.selectOptions(picker, "uid-1");
 		await waitFor(() => expect(invoked("voice_input_set")).toHaveLength(1));
+	});
+
+	it("follows the system instead of the snapshot it read when it opened (S1)", async () => {
+		const { picker } = await openMicrophone();
+		expect(
+			within(picker)
+				.getAllByRole("option")
+				.map((option) => option.textContent),
+		).toEqual(["System default", "MacBook Pro Microphone", "Shure MV7"]);
+		// A headset is connected or paired and the app pushes the whole list again.
+		await push("voice://devices", {
+			devices: [...h.devices, { uid: "uid-3", name: "AirPods Pro" }],
+			chosen: null,
+			default: "uid-3",
+		});
+		expect(
+			within(picker)
+				.getAllByRole("option")
+				.map((option) => option.textContent),
+		).toEqual(["System default", "MacBook Pro Microphone", "Shure MV7", "AirPods Pro"]);
+		expect(invoked("voice_input_set")).toHaveLength(0);
+	});
+
+	it("warns as soon as a pushed list loses the chosen device (S3)", async () => {
+		h.chosen = "uid-2";
+		const { section, picker } = await openMicrophone();
+		expect(picker).toHaveValue("uid-2");
+		await push("voice://devices", {
+			devices: [{ uid: "uid-1", name: "MacBook Pro Microphone" }],
+			chosen: "uid-2",
+			default: "uid-1",
+		});
+		expect(await within(section).findByRole("alert")).toHaveTextContent(
+			"The chosen microphone is not connected. The system default is used instead.",
+		);
+		// The choice stays stored and nothing is asked again: the recording falls back on its own.
+		expect(invoked("voice_input_set")).toHaveLength(0);
 	});
 });
 

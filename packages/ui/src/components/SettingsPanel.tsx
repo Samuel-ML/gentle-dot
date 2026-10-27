@@ -11,7 +11,7 @@ import {
 } from "../shortcut.ts";
 import { deviceLabel, deviceValue, missingChoice } from "../voice-device.ts";
 import { setVoiceLanguage, VOICE_LANGUAGES, voiceLanguage } from "../voice-language.ts";
-import { loadVoiceInputOptions, saveVoiceInput, type VoiceInputOptions } from "../voice-native.ts";
+import { loadVoiceInputOptions, onVoiceDevices, saveVoiceInput, type VoiceInputOptions } from "../voice-native.ts";
 import "../settings.css";
 
 type Status =
@@ -104,8 +104,19 @@ export function SettingsPanel({ close }: { close: () => void }) {
 				if (live.current) setInputLoadFailed(true);
 			},
 		);
+		// The app pushes the whole list whenever the Mac's devices change (S1): the picker follows
+		// the system from then on, instead of the snapshot it read when it opened.
+		let stopDevices: (() => void) | undefined;
+		void onVoiceDevices((pushed) => {
+			if (!live.current) return;
+			setInput(pushed);
+			setInputLoadFailed(false);
+		}).then((stop) => {
+			stopDevices = stop;
+		});
 		return () => {
 			live.current = false;
+			stopDevices?.();
 		};
 	}, []);
 

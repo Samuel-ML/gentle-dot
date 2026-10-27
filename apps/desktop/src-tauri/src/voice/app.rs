@@ -18,7 +18,8 @@ use crate::config::DesktopConfig;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// How long each retry waits before trying the microphone again: a second, then doubling.
 const RETRY_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
@@ -72,9 +73,23 @@ pub const COMMANDS: [&str; 13] = [
 pub const EMPTY_INPUT: &str = "Choose a microphone to record from.";
 
 
+/// How long the panel waits for a burst of device notifications to settle before it is told (S1):
+/// a Bluetooth headset flips between its two profiles several times a second (S2), and every flip
+/// is a notification.
+const DEVICES_SETTLE_MS: u64 = 300;
+
 /// The platform's input devices (UID and display name) and the UID of its default input. A
 /// function rather than a call so the tests answer fixed devices instead of this Mac's.
 type Enumerate = fn() -> (Vec<StoredInput>, Option<String>);
+
+/// Where a changed microphone list goes: the panel's `voice://devices` (S1, S2).
+type DevicesEvents = Arc<dyn Fn(&InputOptions) + Send + Sync>;
+
+/// Installs the system's device notifications, calling back on every change, and hands back the
+/// registration whose drop removes it (S4). A closure rather than a call for the same reason as
+/// `Enumerate`: the tests drive the notifications instead of opening a real CoreAudio listener.
+type Watch =
+    Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>) -> Result<Option<Box<dyn Send + Sync>>, String> + Send + Sync>;
 
 /// macOS asks CoreAudio (S1-S4); elsewhere the system default input is all there is, so the
 /// panel gets an empty list rather than a device it could never select (S7, Linux).
@@ -86,6 +101,29 @@ fn platform_devices() -> (Vec<StoredInput>, Option<String>) {
     );
     #[cfg(not(target_os = "macos"))]
     (Vec::new(), None)
+}
+
+/// macOS: the CoreAudio listener (S2). Elsewhere no notification exists, so nothing is watched and
+/// the list stays what it was: there is only one input there and nothing to switch to.
+fn platform_watch(changed: Arc<dyn Fn() + Send + Sync>) -> Result<Option<Box<dyn Send + Sync>>, String> {
+    #[cfg(target_os = "macos")]
+    return super::core_audio::DeviceListener::install(changed)
+        .map(|listener| Some(Box::new(listener) as Box<dyn Send + Sync>));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = changed;
+        Ok(None)
+    }
+}
+
+/// The `voice_input_options` reply, out of what the system reports and what is stored: one
+/// function, so the pushed list and the answered one cannot disagree (S1).
+fn options(devices: Enumerate, stored: &Mutex<Option<StoredInput>>) -> InputOptions {
+    let (devices, default) = devices();
+    // The stored choice stays in the answer even when the device is gone, so the panel can warn
+    // about it (S3); a recording from it falls back to the default.
+    let chosen = stored.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|input| input.uid.clone());
+    InputOptions { devices, chosen, default }
 }
 
 /// The choice in `config.json`, read once at startup, and the file it is written back to.
@@ -111,6 +149,55 @@ pub struct InputChoice {
     pub chosen: Option<String>,
 }
 
+/// The watch that keeps the panel's list in step with the system (S1, S2): the registration the
+/// system notifies, and the channel that keeps its worker alive. Both are held for what dropping
+/// them does, which is the shutdown (S4).
+struct DevicesWatch {
+    /// Listed first so it goes first: the listener is removed before the channel it pokes closes.
+    _registration: Box<dyn Send + Sync>,
+    /// Open for as long as the watch lives: closing it is how the worker is told to leave.
+    _pokes: mpsc::Sender<()>,
+}
+
+/// The worker behind `voice://devices` (S1, S2): waits for a notification, lets the burst settle,
+/// reads the list again and pushes it only when it differs from the last one pushed.
+fn follow_devices(
+    devices: Enumerate,
+    stored: Arc<Mutex<Option<StoredInput>>>,
+    events: DevicesEvents,
+    asked: mpsc::Receiver<()>,
+    mut last: InputOptions,
+) {
+    let settle = Duration::from_millis(DEVICES_SETTLE_MS);
+    loop {
+        // A closed channel is the watch being dropped, which is the app going away (S4).
+        if asked.recv().is_err() {
+            return;
+        }
+        // The wait restarts with every notification, so a device that announces itself eight times
+        // in as many hundreds of milliseconds is read once, settled (S1).
+        let mut changed_at = Instant::now();
+        loop {
+            let left = settle.saturating_sub(changed_at.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match asked.recv_timeout(left) {
+                Ok(()) => changed_at = Instant::now(),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        let current = options(devices, &stored);
+        // Byte for byte the list the panel already shows: it is not told, so it does not re-render.
+        if current == last {
+            continue;
+        }
+        last = current.clone();
+        events(&current);
+    }
+}
+
 /// Voice input, when this platform has a backend, and the wake word that listens on the same
 /// microphone (S30.7).
 pub struct VoiceInput {
@@ -118,21 +205,42 @@ pub struct VoiceInput {
     wake: Option<Wake>,
     /// `config.json`, where the microphone choice is kept between recordings and launches (S2).
     config: PathBuf,
-    /// The stored microphone; `None` follows the system default input.
-    stored: Mutex<Option<StoredInput>>,
+    /// The stored microphone; `None` follows the system default input. Shared with the watch, so
+    /// a pushed list carries the choice the recording will read (S1).
+    stored: Arc<Mutex<Option<StoredInput>>>,
     /// The inputs this platform offers and its default, read when the panel asks.
     devices: Enumerate,
+    /// How this platform is told that its devices changed (S1, S2).
+    watch: Watch,
+    /// The watch itself, once it is installed: the listener and the worker behind it (S4).
+    watched: Mutex<Option<DevicesWatch>>,
 }
 
 impl VoiceInput {
     pub fn new(voice: Voice) -> Self {
         let (config, stored) = stored_input();
-        VoiceInput { voice: Some(voice), wake: None, config, stored: Mutex::new(stored), devices: platform_devices }
+        VoiceInput {
+            voice: Some(voice),
+            wake: None,
+            config,
+            stored: Arc::new(Mutex::new(stored)),
+            devices: platform_devices,
+            watch: Arc::new(platform_watch),
+            watched: Mutex::new(None),
+        }
     }
 
     pub fn unsupported() -> Self {
         let (config, stored) = stored_input();
-        VoiceInput { voice: None, wake: None, config, stored: Mutex::new(stored), devices: platform_devices }
+        VoiceInput {
+            voice: None,
+            wake: None,
+            config,
+            stored: Arc::new(Mutex::new(stored)),
+            devices: platform_devices,
+            watch: Arc::new(platform_watch),
+            watched: Mutex::new(None),
+        }
     }
 
     fn voice(&self) -> Result<&Voice, VoiceError> {
@@ -146,10 +254,42 @@ impl VoiceInput {
 
     /// The devices the panel may choose from, the stored choice, and the system default.
     pub fn input_options(&self) -> InputOptions {
-        let (devices, default) = (self.devices)();
-        // The stored choice stays in the answer even when the device is gone, so the panel can
-        // warn about it (S3); a recording from it falls back to the default.
-        InputOptions { devices, chosen: self.chosen(), default }
+        options(self.devices, &self.stored)
+    }
+
+    /// Keeps the panel's microphone list in step with the system instead of leaving it the snapshot
+    /// it read when it opened (S1, S2): the whole reply is pushed once now, and again after every
+    /// change CoreAudio reports, once the change has settled and only if the list really differs. A
+    /// listener that cannot be installed is logged with its reason, so a list that stops following
+    /// the system is known instead of silent (S4).
+    pub fn watch_devices(&mut self, events: DevicesEvents) {
+        let first = self.input_options();
+        // The list as it is now, before anything can change it: the panel's own read of it may be
+        // older than this process.
+        events(&first);
+        let (pokes, asked) = mpsc::channel();
+        let kept = pokes.clone();
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            // A send that fails is a worker that already left: nothing left to tell it.
+            let _ = pokes.send(());
+        });
+        let registration = match (self.watch)(notify) {
+            Ok(Some(registration)) => registration,
+            // S4: the list will not follow the system, and this is why.
+            Err(reason) => return eprintln!("gentle-dot: the microphone list will not follow the system: {reason}"),
+            // Nothing on this platform notifies: there is no worker to poke.
+            Ok(None) => return,
+        };
+        let (devices, stored) = (self.devices, Arc::clone(&self.stored));
+        std::thread::spawn(move || follow_devices(devices, stored, events, asked, first));
+        *self.watched.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(DevicesWatch { _registration: registration, _pokes: kept });
+    }
+
+    /// Stops following the system (S4): the listener is removed, so no notification outlives the
+    /// app, and the worker ends with the channel it waits on.
+    pub fn stop_watching_devices(&self) {
+        drop(self.watched.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
     }
 
     /// Stores the choice (a device UID, or `None` to follow the system default) in `config.json`
@@ -1011,6 +1151,16 @@ pub fn start(app: &AppHandle) -> (VoiceInput, VoiceModel) {
     // S1: the flag is read here and applied now; a failure is logged with its reason.
     wake.startup(config.wake_word);
     input.wake = Some(wake);
+    // S1, S2: the panel's list follows the system from here on, instead of the snapshot it read
+    // when it opened. A listener that cannot be installed says so instead of going quiet (S4).
+    let devices = app.clone();
+    let devices_target = EventTarget::webview_window(crate::shell::PANEL);
+    let device_events: DevicesEvents = Arc::new(move |options: &InputOptions| {
+        if let Err(error) = devices.emit_to(devices_target.clone(), super::DEVICES_EVENT, options.clone()) {
+            eprintln!("gentle-dot: cannot send the microphone list: {error}");
+        }
+    });
+    input.watch_devices(device_events);
     (input, VoiceModel { manager, local })
 }
 
@@ -1228,6 +1378,73 @@ mod tests {
             let permission = format!("allow-{}", command.replace('_', "-"));
             assert_eq!(granted_to(&permission), vec!["panel"], "{permission}");
         }
+    }
+
+    #[test]
+    fn the_panel_listens_for_the_pushed_microphone_list() {
+        // The name is the whole contract between the two sides (S1, S2): it is checked here
+        // because the Rust and the TypeScript tests can never see each other.
+        let ui = include_str!("../../../../../packages/ui/src/voice-native.ts");
+        let name = crate::voice::DEVICES_EVENT;
+        assert!(ui.contains(&format!("\"{name}\"")), "voice-native.ts does not accept {name}");
+    }
+
+    /// What the system reports to the scripted watch: a built-in microphone, and a headset once one
+    /// is "connected" (S1). A `static` because `Enumerate` is a plain function pointer.
+    static HEADSET_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+    fn scripted_devices() -> (Vec<StoredInput>, Option<String>) {
+        let mut devices = vec![StoredInput { uid: "uid-1".into(), name: "MacBook Pro Microphone".into() }];
+        if HEADSET_CONNECTED.load(Ordering::SeqCst) {
+            devices.push(StoredInput { uid: "uid-3".into(), name: "AirPods Pro".into() });
+        }
+        (devices, Some("uid-1".into()))
+    }
+
+    #[test]
+    fn the_microphone_list_follows_the_system_and_a_storm_pushes_it_once() {
+        HEADSET_CONNECTED.store(false, Ordering::SeqCst);
+        let mut input = VoiceInput::unsupported();
+        *input.stored.lock().unwrap() = None;
+        input.devices = scripted_devices;
+        // The notification the system would send, held here instead of in CoreAudio (S2).
+        let notified: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
+        {
+            let notified = Arc::clone(&notified);
+            input.watch = Arc::new(move |changed: Arc<dyn Fn() + Send + Sync>| {
+                *notified.lock().unwrap() = Some(changed);
+                Ok(Some(Box::new(()) as Box<dyn Send + Sync>))
+            });
+        }
+        let pushed: Arc<Mutex<Vec<InputOptions>>> = Arc::new(Mutex::new(Vec::new()));
+        let recording: DevicesEvents = {
+            let pushed = Arc::clone(&pushed);
+            Arc::new(move |options: &InputOptions| pushed.lock().unwrap().push(options.clone()))
+        };
+        input.watch_devices(recording);
+        // The whole reply, pushed once as soon as the watch is armed (S1).
+        assert_eq!(pushed.lock().unwrap().len(), 1);
+        assert_eq!(pushed.lock().unwrap()[0], input.input_options());
+
+        // The headset is connected and Bluetooth announces the change twice: one settled push.
+        HEADSET_CONNECTED.store(true, Ordering::SeqCst);
+        let notify = notified.lock().unwrap().clone().expect("the system notifies this watch");
+        notify();
+        notify();
+        wait_until("the new list is pushed", || pushed.lock().unwrap().len() == 2);
+        let settled = pushed.lock().unwrap()[1].clone();
+        assert_eq!(settled.devices.len(), 2, "the headset is in the pushed list");
+        assert_eq!(settled.chosen, None, "the choice travels with the list (S3)");
+        assert_eq!(settled.default.as_deref(), Some("uid-1"));
+        assert_eq!(settled, input.input_options(), "the push and the reply are one payload");
+
+        // A notification that changed nothing is not pushed again: the panel must not re-render.
+        notify();
+        std::thread::sleep(Duration::from_millis(DEVICES_SETTLE_MS * 2));
+        assert_eq!(pushed.lock().unwrap().len(), 2, "an unchanged list is not pushed again");
+        // S4: the watch takes the listener and its worker with it.
+        input.stop_watching_devices();
+        assert!(input.watched.lock().unwrap().is_none());
     }
 
     fn config(dir: PathBuf) -> DesktopConfig {

@@ -22,8 +22,8 @@ Plugging a headset in, or pairing one, does nothing until Gentle Dot is quit and
 | ID | Specs | Route | Commit |
 |----|-------|-------|--------|
 | T1 | S1, S2 | Explore: how devices are enumerated today, which files and commands are involved, and what a CoreAudio property listener would cost | — |
-| T2 | S1, S2 | The listener: `core_audio` watches `kAudioHardwarePropertyDevices` and the default input, the app pushes a `voice://devices` event, the panel re-renders | — |
-| T3 | S3, S4 | A vanished chosen device reads as missing; the listener is removed on shutdown and its failure is logged | — |
+| T2 ✅ (ver Log L2) | S1, S2 | The listener: `core_audio` watches `kAudioHardwarePropertyDevices` and the default input, the app pushes a `voice://devices` event, the panel re-renders | — |
+| T3 ✅ (ver Log L2) | S3, S4 | A vanished chosen device reads as missing; the listener is removed on shutdown and its failure is logged | — |
 
 ## Log
 
@@ -33,3 +33,14 @@ Plugging a headset in, or pairing one, does nothing until Gentle Dot is quit and
   por eso creo que la solución debería ser tener un canal de escucha sobre los input voices, has una
   revisión con un agente para que valide cuál es la implementación actual de eso, qué archivos están
   implicados, puedes usar odd para toda la implementación más el todo y sus tasks"
+- L2 — Delivered (exploration `mvqt39nf`, worker `mvqt5r5y`, reviewed here). The list was never
+  cached; the panel asked once at mount, which is why a device connected later could not appear. A
+  CoreAudio property listener (`AudioObjectAddPropertyListenerBlock` on the main queue for
+  `kAudioHardwarePropertyDevices` and the default input) now pokes a worker that settles the burst
+  for 300 ms, enumerates, compares the serialized reply and emits `voice://devices` with exactly the
+  `voice_input_options` payload. The registration is owned by a field whose drop removes it and is
+  logged with its OSStatus when it cannot be installed. The wake/capture path is untouched, and
+  "Restart assistant" remains a daemon action.
+- L3 — Verified: `cargo test` 487 passed (4 ignored), `pnpm -s typecheck` clean, `pnpm -s test` 814
+  passed. Not verified: the push against real CoreAudio and the rendered picker (jsdom only); the
+  field check is plugging a headset in with the app open.

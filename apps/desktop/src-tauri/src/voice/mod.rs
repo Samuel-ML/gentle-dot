@@ -71,6 +71,9 @@ pub const STARTED_EVENT: &str = "voice://started";
 /// same way it sends one it stopped.
 pub const STATE_EVENT: &str = "voice://state";
 pub const TRANSCRIPT_EVENT: &str = "voice://transcript";
+/// The microphone list the panel shows, pushed whenever the Mac's devices change (S1, S2):
+/// `{devices:[{uid,name}], chosen, default}`, the same payload `voice_input_options` answers.
+pub const DEVICES_EVENT: &str = "voice://devices";
 pub const UNSUPPORTED: &str = "Voice input is available on macOS and Linux.";
 
 /// The `voice_status` reply: `{available, reason?}`.

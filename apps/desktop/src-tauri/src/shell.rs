@@ -904,6 +904,9 @@ pub fn run() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 app.state::<Shell>().daemon.stop();
+                // S4: the microphone listener is removed here, so no CoreAudio notification
+                // outlives the app it was installed for.
+                app.state::<voice::VoiceInput>().stop_watching_devices();
             }
         });
 }

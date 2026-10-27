@@ -23,11 +23,17 @@ type CFStringRef = *const CFString;
 
 /// `AudioObjectPropertyAddress`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Address {
     selector: ObjectId,
     scope: ObjectId,
     element: ObjectId,
 }
+
+/// `AudioObjectPropertyListenerBlock`: the block CoreAudio calls when a watched property moves,
+/// with how many addresses moved and the addresses themselves. The addresses are never read here
+/// (the whole list is read again), so they stay the C pointer they are.
+type ListenerBlock = block2::DynBlock<dyn Fn(u32, *const c_void)>;
 
 /// `kAudioObjectSystemObject`: the object the device list and the default input hang off.
 const SYSTEM_OBJECT: ObjectId = 1;
@@ -66,6 +72,32 @@ extern "C" {
         size: *mut u32,
         data: *mut c_void,
     ) -> i32;
+    fn AudioObjectAddPropertyListenerBlock(
+        object: ObjectId,
+        address: *const Address,
+        queue: *mut c_void,
+        block: *mut ListenerBlock,
+    ) -> i32;
+    fn AudioObjectRemovePropertyListenerBlock(
+        object: ObjectId,
+        address: *const Address,
+        queue: *mut c_void,
+        block: *mut ListenerBlock,
+    ) -> i32;
+}
+
+// The main queue is the global `_dispatch_main_q`; `dispatch_get_main_queue()` is a macro over it
+// (`dispatch/queue.h`), so the symbol to link against is the object, not a function.
+#[link(name = "System")]
+extern "C" {
+    #[allow(non_upper_case_globals)]
+    static _dispatch_main_q: c_void;
+}
+
+/// The main queue, as a listener registration takes it.
+fn main_queue() -> *mut c_void {
+    // SAFETY: a process-wide object that outlives every call here; only its address is taken.
+    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
 }
 
 #[link(name = "AudioToolbox", kind = "framework")]
@@ -95,6 +127,86 @@ pub struct InputDevice {
     pub uid: String,
     /// What the device calls itself, for the panel.
     pub name: String,
+}
+
+/// The two properties whose change means the panel's list is stale (S1, S2): what the Mac has, and
+/// which of it the system records from.
+const WATCHED: [Address; 2] = [
+    Address { selector: HARDWARE_DEVICES, scope: SCOPE_GLOBAL, element: ELEMENT_MAIN },
+    Address { selector: DEFAULT_INPUT, scope: SCOPE_GLOBAL, element: ELEMENT_MAIN },
+];
+
+/// CoreAudio's notification that the devices or the default input moved (S1, S2). CoreAudio keeps
+/// the block until it is removed, so this owns it and `Drop` is the removal (S4).
+pub struct DeviceListener {
+    block: block2::RcBlock<dyn Fn(u32, *const c_void)>,
+    /// The addresses the registration succeeded for: a listener is never left half-installed.
+    added: Vec<Address>,
+}
+
+// SAFETY: the block only ever runs on the main queue it was registered on, and the registration is
+// removed by CoreAudio itself, which takes its own lock; nothing here is borrowed across threads.
+unsafe impl Send for DeviceListener {}
+unsafe impl Sync for DeviceListener {}
+
+impl DeviceListener {
+    /// Watches the device list and the default input, calling `changed` on the main queue when
+    /// either one moves. `Err` says why CoreAudio refused, so a list that will not follow the
+    /// system is logged instead of going quietly stale (S4).
+    pub fn install(changed: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        let block = block2::RcBlock::new(move |_count: u32, _addresses: *const c_void| changed());
+        // SAFETY: the main queue, which the system notifies on: no run loop of ours is needed.
+        let queue = main_queue();
+        let mut listener = DeviceListener { block, added: Vec::new() };
+        for address in WATCHED {
+            // SAFETY: the block matches `AudioObjectPropertyListenerBlock` and is owned here, so it
+            // outlives the registration; the address is a property of the system object.
+            let status = unsafe {
+                AudioObjectAddPropertyListenerBlock(
+                    SYSTEM_OBJECT,
+                    &address,
+                    queue,
+                    &*listener.block as *const ListenerBlock as *mut ListenerBlock,
+                )
+            };
+            if status != 0 {
+                let selector = selector_name(address.selector);
+                // Whatever was registered goes with it: a half-installed listener is not a watch.
+                drop(listener);
+                return Err(format!("kAudioHardwareProperty {selector} could not be watched (OSStatus {status})"));
+            }
+            listener.added.push(address);
+        }
+        Ok(listener)
+    }
+}
+
+impl Drop for DeviceListener {
+    fn drop(&mut self) {
+        // SAFETY: the same block and queue the registration used, removed once per address added.
+        let queue = main_queue();
+        for address in &self.added {
+            let status = unsafe {
+                AudioObjectRemovePropertyListenerBlock(
+                    SYSTEM_OBJECT,
+                    address,
+                    queue,
+                    &*self.block as *const ListenerBlock as *mut ListenerBlock,
+                )
+            };
+            if status != 0 {
+                eprintln!(
+                    "gentle-dot: kAudioHardwareProperty {} could not be unwatched (OSStatus {status})",
+                    selector_name(address.selector)
+                );
+            }
+        }
+    }
+}
+
+/// A selector as the four characters it is spelled with, for a log line that names what failed.
+fn selector_name(selector: ObjectId) -> String {
+    String::from_utf8_lossy(&selector.to_be_bytes()).into_owned()
 }
 
 /// Every device with at least one input stream, with its UID and its name, in the order the
@@ -265,6 +377,13 @@ mod tests {
         assert_eq!(uids.len(), inputs.len(), "a UID appears twice in the list");
         // The system default is a UID, empty or absent only when the query failed.
         assert!(default_input_uid().is_none_or(|uid| !uid.is_empty()));
+    }
+
+    #[test]
+    fn a_selector_reads_back_as_its_four_characters() {
+        // The log line that says which property CoreAudio refused has to name it (S4).
+        assert_eq!(selector_name(HARDWARE_DEVICES), "dev#");
+        assert_eq!(selector_name(DEFAULT_INPUT), "dIn ");
     }
 
     #[test]
