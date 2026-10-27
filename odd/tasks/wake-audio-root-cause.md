@@ -29,6 +29,7 @@ nothing. This task is an audit, not another patch: the design is under suspicion
 | T5 ✅ `051e264` | S2, S4 | Supervisor: one owner of `(enabled, capture, delivering)`; the only caller of arm/disarm/resume; every other actor sends it an intent | — |
 | T6 ✅ `051e264` | S2 | Liveness for both sinks: a frame count per capture (Listener and Recording), so "open and mute" is observed where it happens | — |
 | T7 ✅ `509041a` | S5 | One state contract: `voice://state {wake, capture, mic}` on every transition; the panel mirrors it, and `set` rolls back so the switch never lies | — |
+| T9 | S3 | One audio engine for the app's life: open once, swap the sink between detector and note, close only when the switch goes off or the device changes | — |
 | T8 | S3 | Device chain in one place (chosen → default → built-in) with the sticky flags reset when frames arrive | — |
 
 ## Log
@@ -54,3 +55,7 @@ nothing. This task is an audit, not another patch: the design is under suspicion
 - L5 — Still open: T8 (the device chain now walks chosen → default → built-in inside the supervisor,
   but its transitions deserve a measurement with the headset awake and as the system input, and the
   Bluetooth profile question is a platform limit, not a bug).
+- L6 — Measured, not suspected: 16 of the last 18 `resumed` are followed by `capture_lost` within 12 s,
+  so a freshly opened capture is mute on this machine. The user approved T9 (one engine, swappable
+  sink). Process: an exploration agent checks the plan against the real audio thread first, then a
+  worker implements it, then the parent reviews the diff, runs the checks and commits.
