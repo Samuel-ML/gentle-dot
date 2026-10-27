@@ -1,7 +1,7 @@
 //! Fakes for the voice tests: a microphone and a recognizer that record what the machine asks
 //! of them and let a test play the platform's side (audio, results, failures).
 
-use super::{AudioSink, Authorization, Events, Microphone, NativeAudio, Recognition, Recognizer, Sink, Stream, VoiceError, VoiceEvent};
+use super::{AudioSink, Authorization, Events, Microphone, NativeAudio, Recognition, Recognizer, Sink, SinkSlot, Stream, VoiceError, VoiceEvent};
 use super::{ListenEvent, ListenEvents};
 use crate::computer::Clock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,11 +38,26 @@ pub struct MicLog {
     pub history: Vec<&'static str>,
     /// How many times a capture opened while another was still open (S5: it must never happen).
     pub overlap: usize,
-    /// One sink per capture, oldest first: audio for the detector stays reachable after a note.
-    pub sinks: Vec<AudioSink>,
+    /// The sink the capture is attached to right now, and every change to it: with one engine the
+    /// swaps replace the captures a test used to count (T9).
+    pub sink: Option<AudioSink>,
+    pub selected: Vec<&'static str>,
     /// The device each capture was asked for; `None` is the system default input.
     pub devices: Vec<Option<String>>,
-    pub sink: Option<AudioSink>,
+    /// Buffers the engine delivered, whoever the sink was: a fresh counter per capture.
+    pub frames: Arc<AtomicU64>,
+}
+
+impl MicLog {
+    /// A note owns the audio right now.
+    pub fn recording(&self) -> bool {
+        matches!(self.sink, Some(AudioSink::Recording(_)))
+    }
+
+    /// The detector owns the audio right now.
+    pub fn listening(&self) -> bool {
+        matches!(self.sink, Some(AudioSink::Listener(_)))
+    }
 }
 
 pub struct FakeMicrophone {
@@ -72,9 +87,12 @@ impl FakeMicrophone {
         mic
     }
 
-    /// The sink of the latest capture, to play the audio thread.
+    /// The sink of the latest capture, to play the audio thread. Each call is one buffer the engine
+    /// delivered, which is what keeps the capture alive in the machine's eyes (T9).
     pub fn sink(&self) -> AudioSink {
-        self.log.lock().unwrap().sink.clone().expect("the microphone was opened")
+        let log = self.log.lock().unwrap();
+        log.frames.fetch_add(1, Ordering::SeqCst);
+        log.sink.clone().expect("the capture is attached to a sink")
     }
 }
 
@@ -82,6 +100,13 @@ impl FakeMicrophone {
     /// Makes the next captures fail, or lets them work again.
     pub fn set_open_error(&self, error: Option<VoiceError>) {
         *self.open_error.lock().unwrap() = error;
+    }
+
+    /// The engine stopped delivering: the counter the open capture reports no longer moves, however
+    /// much audio a test still plays through its sink (a device that went away, a Bluetooth input
+    /// that slept). The next capture opened here counts from zero again.
+    pub fn stop_delivering(&self) {
+        self.log.lock().unwrap().frames = Arc::new(AtomicU64::new(0));
     }
 }
 
@@ -100,7 +125,7 @@ impl Microphone for FakeMicrophone {
         answer
     }
 
-    fn open(&self, device: Option<&str>, sink: AudioSink) -> Result<Box<dyn Stream>, VoiceError> {
+    fn open(&self, device: Option<&str>, slot: SinkSlot) -> Result<Box<dyn Stream>, VoiceError> {
         if let Some(error) = self.open_error.lock().unwrap().clone() {
             // A refused capture still records which device was asked for: the fallback chain is
             // only observable through it.
@@ -115,14 +140,18 @@ impl Microphone for FakeMicrophone {
         }
         log.history.push("open");
         log.devices.push(device.map(str::to_string));
-        log.sinks.push(sink.clone());
-        log.sink = Some(sink);
-        Ok(Box::new(FakeStream { log: self.log.clone() }))
+        // A fresh engine counts from zero, as a real device's tap would.
+        let frames = Arc::new(AtomicU64::new(0));
+        log.frames = frames.clone();
+        log.sink = None;
+        Ok(Box::new(FakeStream { log: self.log.clone(), slot, frames }))
     }
 }
 
 struct FakeStream {
     log: Arc<Mutex<MicLog>>,
+    slot: SinkSlot,
+    frames: Arc<AtomicU64>,
 }
 
 impl Stream for FakeStream {
@@ -130,6 +159,24 @@ impl Stream for FakeStream {
         let mut log = self.log.lock().unwrap();
         log.closed += 1;
         log.history.push("close");
+    }
+
+    fn select(&mut self, sink: Option<AudioSink>) {
+        let name = match &sink {
+            Some(AudioSink::Recording(_)) => "recording",
+            Some(AudioSink::Listener(_)) => "listener",
+            None => "none",
+        };
+        if let Ok(mut slot) = self.slot.write() {
+            *slot = sink.clone();
+        }
+        let mut log = self.log.lock().unwrap();
+        log.selected.push(name);
+        log.sink = sink;
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames.load(Ordering::SeqCst)
     }
 }
 

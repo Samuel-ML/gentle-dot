@@ -1,16 +1,18 @@
 //! The voice state machine: one recording at a time, between a `Microphone` and a `Recognizer`.
 //!
-//! Idle → Starting (permissions, locale, recognition, capture) → Recording → Stopping → Idle.
+//! Idle → Starting (permissions, locale, recognition, the capture) → Recording → Stopping → Idle.
 //! Cancel works in every state. Platform callbacks arrive on arbitrary threads through a
 //! `Sink` bound to one recording, so results from an earlier recording are ignored. No
 //! platform call or event is made while the state lock is held.
 //!
-//! While nothing records, the machine can hold the wake word's listener on the same capture
-//! (`arm`, S2); a recording takes the microphone from it, and the note the wake word starts ends
-//! itself by energy (`start_woken`, S6).
+//! One capture serves the whole machine (T9): it is opened when the microphone is first needed and
+//! kept until the switch goes off or the device changes. A note and the wake word's listener (`arm`,
+//! S2) are sinks it is pointed at, so nothing opens the device per note — measured as a mute capture
+//! 16 times out of 18 on this machine. A note the wake word starts ends itself by energy
+//! (`start_woken`, S6).
 
 use super::wake::WakeWord;
-use super::{audio, locale, AudioSink, Authorization, Events, Listener, Microphone, NativeAudio, Recognition, Recognizer, Stream, Transcript};
+use super::{audio, locale, AudioSink, Authorization, Events, Listener, Microphone, NativeAudio, Recognition, Recognizer, SinkSlot, Stream, Transcript};
 use super::{VoiceError, VoiceEvent, VoiceStatus};
 use crate::computer::Clock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +23,12 @@ use std::time::{Duration, Instant};
 pub const LEVEL_INTERVAL_MS: u64 = 1_000 / 15;
 /// How long `stop` waits for the final transcript before using the latest partial.
 pub const FINAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a capture may deliver nothing before `arm` or `begin` replace it: the engine the app
+/// keeps runs from the first note until the switch goes off, and one that stopped delivering lost
+/// the device (a route change that stopped it, a Bluetooth input that slept). The tap delivers
+/// about fifty buffers a second, so this is two orders of magnitude of slack, and far below the
+/// supervisor's own tolerance, so recovery still has room to act.
+pub const CAPTURE_DEAD_MS: u64 = 1_000;
 
 /// Nothing quieter than this counts as speech, whatever the room claims (-50 dBFS): the floor
 /// measured in a quiet room sits at rms 0.003, twenty times below ordinary speech.
@@ -73,32 +81,58 @@ struct Inner {
     changed: Condvar,
     /// Ids the listener's audio is checked against, so audio from a closed listener is ignored.
     next_listen: AtomicU64,
-    /// When the detector last received audio, in milliseconds. A capture can stay open and deliver
-    /// nothing (a Bluetooth headset that slept, a device that went away), and that is invisible
-    /// without this: the detector looks armed and hears nothing (S1).
-    last_frame_ms: AtomicU64,
-    /// How many frames the detector has received in total: a capture that opened must raise this
-    /// to count as alive, whatever the clock says.
-    frames_seen: AtomicU64,
+    /// The one capture, opened when the microphone is first needed and kept across notes until the
+    /// switch goes off or the device changes (T9). It belongs to the machine, not to a state, so no
+    /// transition can drop it: opening one per note produced a mute capture 16 times out of 18.
+    capture: Mutex<Option<Capture>>,
+    /// How long a capture may deliver nothing before it is replaced, shortened so a test does not
+    /// wait a second.
+    capture_dead_ms: AtomicU64,
+}
+
+/// The microphone the machine owns: one engine, its tap, and the count of buffers it delivered.
+struct Capture {
+    stream: Box<dyn Stream>,
+    /// The device it was opened for (`None` is the system default input): asking for another one
+    /// replaces it.
+    device: Option<String>,
+    /// The engine's buffer count when it was last read, and when it last moved.
+    frames: u64,
+    moved_ms: u64,
+}
+
+impl Capture {
+    /// The engine's buffer count, remembering when it last moved. Every reader goes through here,
+    /// so the clock is touched once per observation and not on the audio thread.
+    fn frames_now(&mut self) -> u64 {
+        let frames = self.stream.frames();
+        if frames > self.frames {
+            self.frames = frames;
+            self.moved_ms = millis();
+        }
+        frames
+    }
+
+    /// Whether it is still the capture to use: the device asked for, and still delivering.
+    fn usable(&self, device: Option<&str>, dead_ms: u64) -> bool {
+        self.device.as_deref() == device && millis().saturating_sub(self.moved_ms) <= dead_ms
+    }
 }
 
 enum State {
     /// Nothing is recording. `armed` is the wake word's listener, when one is waiting.
     Idle { next: u64, armed: Option<Armed> },
-    /// A capture is being closed on the caller's thread. Both `arm` and `begin` refuse it, so no
-    /// capture is ever opened while another closes (S5).
-    Closing { next: u64 },
     Starting { recording: u64, cancelled: bool, failure: Option<String> },
     Recording(Session),
     Stopping(Session),
 }
 
-/// Waiting for the wake word on an open capture, so the detector reads the microphone the app
-/// already has instead of opening a second one (S2).
+/// Waiting for the wake word on the machine's capture, so the detector reads the microphone the app
+/// already has instead of opening one of its own (S2, T9).
 struct Armed {
     id: u64,
-    /// `None` while the capture opens: a recording must not start on top of it.
-    stream: Option<Box<dyn Stream>>,
+    /// Set once the capture delivers to the listener: an arm still opening is not listening yet.
+    attached: bool,
     /// Reset when the listener is disarmed, so the next note never starts with old audio in it.
     wake: Arc<dyn WakeWord>,
 }
@@ -106,7 +140,6 @@ struct Armed {
 struct Session {
     recording: u64,
     events: Events,
-    stream: Option<Box<dyn Stream>>,
     feed: Arc<Mutex<Feed>>,
     transcript: String,
     final_text: Option<String>,
@@ -201,7 +234,7 @@ impl Feed {
 impl State {
     fn recording(&self) -> Option<u64> {
         match self {
-            State::Idle { .. } | State::Closing { .. } => None,
+            State::Idle { .. } => None,
             State::Starting { recording, .. } => Some(*recording),
             State::Recording(session) | State::Stopping(session) => Some(session.recording),
         }
@@ -214,28 +247,27 @@ impl State {
     }
 }
 
-/// Tears a session down outside the state lock.
-fn discard(session: Session) {
-    let Session { mut stream, feed, .. } = session;
-    if let Some(stream) = stream.as_mut() {
-        stream.close();
+/// Points the one capture at `sink`, or at nothing, keeping the engine open (T9). Cheap on purpose:
+/// the platform only writes a slot the tap reads per buffer, so this is safe to call while the
+/// state lock is held, which is what keeps a swap ordered with the transition that caused it.
+fn select(inner: &Inner, sink: Option<AudioSink>) {
+    let mut capture = lock(&inner.capture);
+    if let Some(capture) = capture.as_mut() {
+        capture.frames_now();
+        capture.stream.select(sink);
     }
-    lock(&feed).cancel();
 }
 
-/// Releases a listener's capture and its detector state, outside the state lock.
-fn close_listener(armed: Option<Armed>) {
-    if let Some(armed) = armed {
-        armed.wake.reset();
-        if let Some(mut stream) = armed.stream {
-            stream.close();
-        }
-    }
+/// Tears a session down outside the state lock: the capture stops delivering to it and the
+/// recognition is cancelled. The capture itself stays open (T9).
+fn discard(inner: &Inner, session: Session) {
+    select(inner, None);
+    lock(&session.feed).cancel();
 }
 
 /// Whether the listener `id` is still the one waiting: an id the machine dropped hears nothing.
 fn armed(inner: &Inner, id: u64) -> bool {
-    matches!(&*lock(&inner.state), State::Idle { armed: Some(armed), .. } if armed.id == id && armed.stream.is_some())
+    matches!(&*lock(&inner.state), State::Idle { armed: Some(armed), .. } if armed.id == id && armed.attached)
 }
 
 /// Milliseconds since the epoch, for the detector's audio clock.
@@ -282,15 +314,14 @@ impl Voice {
             state: Mutex::new(State::Idle { next: 0, armed: None }),
             changed: Condvar::new(),
             next_listen: AtomicU64::new(0),
-            last_frame_ms: AtomicU64::new(0),
-            frames_seen: AtomicU64::new(0),
+            capture: Mutex::new(None),
+            capture_dead_ms: AtomicU64::new(CAPTURE_DEAD_MS),
         };
         Voice { inner: Arc::new(inner), final_timeout: FINAL_TIMEOUT }
     }
 
-    /// Waits for the wake word on the microphone's own capture (S2), reporting through `events`.
-    /// Only while idle: a recording owns the microphone, and a second listener would open it
-    /// twice.
+    /// Waits for the wake word on the machine's own capture (S2), reporting through `events`.
+    /// Only while idle: a recording owns the audio, and a second listener would answer `Busy`.
     pub fn arm(&self, device: Option<&str>, wake: Arc<dyn WakeWord>, events: ListenEvents) -> Result<(), VoiceError> {
         let id = self.inner.next_listen.fetch_add(1, Ordering::SeqCst);
         {
@@ -299,71 +330,84 @@ impl Voice {
             if armed.is_some() {
                 return Err(VoiceError::Busy);
             }
-            *armed = Some(Armed { id, stream: None, wake: wake.clone() });
+            *armed = Some(Armed { id, attached: false, wake: wake.clone() });
         }
-        let opened = self.inner.microphone.open(device, AudioSink::Listener(self.listener(id, wake, events)));
-        let mut state = lock(&self.inner.state);
-        match opened {
-            Ok(stream) => match &mut *state {
-                State::Idle { armed: Some(armed), .. } if armed.id == id => {
-                    armed.stream = Some(stream);
-                    // A fresh capture gets its whole tolerance to deliver a first frame; without
-                    // this the last frame of the previous capture makes it look dead at once.
-                    self.inner.last_frame_ms.store(millis(), Ordering::SeqCst);
-                    Ok(())
-                }
-                // Disarmed or taken over while the capture was opening: the recording keeps the
-                // microphone, and this stream goes away without ever running beside it.
-                _ => {
-                    drop(state);
-                    let mut stream = stream;
-                    stream.close();
-                    Err(VoiceError::Cancelled)
-                }
-            },
-            Err(error) => {
-                if matches!(&*state, State::Idle { armed: Some(armed), .. } if armed.id == id) {
-                    let idle = state.idle();
-                    *state = idle;
-                }
-                Err(error)
+        if let Err(error) = self.ensure_capture(device) {
+            let mut state = lock(&self.inner.state);
+            if matches!(&*state, State::Idle { armed: Some(armed), .. } if armed.id == id) {
+                let idle = state.idle();
+                *state = idle;
             }
+            return Err(error);
         }
+        // The capture is already open and only who it delivers to changes (T9). The check and the
+        // swap share the state lock, so a note that started while the device opened keeps the audio.
+        let mut state = lock(&self.inner.state);
+        match &mut *state {
+            State::Idle { armed: Some(armed), .. } if armed.id == id => armed.attached = true,
+            // Disarmed or taken over while the capture was opening: the recording keeps the audio,
+            // and the listener self-filters by id if a buffer still reaches it.
+            _ => return Err(VoiceError::Cancelled),
+        }
+        select(&self.inner, Some(AudioSink::Listener(self.listener(id, wake, events))));
+        Ok(())
     }
 
-    /// Stops waiting for the wake word; harmless when it is not listening.
+    /// Stops waiting for the wake word; harmless when it is not listening. The capture stays open:
+    /// whoever wants it next points it at itself (T9).
     pub fn disarm(&self) {
         let Some(armed) = self.take_armed() else { return };
-        self.close_then_idle(armed);
+        armed.wake.reset();
+        select(&self.inner, None);
     }
 
-    /// Whether a wake-word capture is open right now (S1, S6): the app logs a resume only when the
-    /// detector is really listening again, not when the call merely returned.
+    /// Whether the detector is really listening right now (S1, S6): the app logs a resume only when
+    /// the capture delivers to it, not when the call merely returned.
     pub fn listening(&self) -> bool {
-        matches!(&*lock(&self.inner.state), State::Idle { armed: Some(armed), .. } if armed.stream.is_some())
+        matches!(&*lock(&self.inner.state), State::Idle { armed: Some(armed), .. } if armed.attached)
     }
 
-    /// Takes the listener out of the idle state so its capture can be closed outside the lock.
+    /// Takes the listener out of the idle state so its detector can be reset outside the lock.
     fn take_armed(&self) -> Option<Armed> {
         let mut state = lock(&self.inner.state);
         let State::Idle { armed, .. } = &mut *state else { return None };
         armed.take()
     }
 
-    /// Closes a listener's capture as its own phase: while it runs the machine answers `Busy`, so
-    /// no other capture can be opened beside the one being closed (S5). Synchronous on purpose —
-    /// `Stream::close` is the only completion point there is, and every caller is off the audio
-    /// thread.
-    fn close_then_idle(&self, armed: Armed) {
-        let next = {
-            let mut state = lock(&self.inner.state);
-            let State::Idle { next, .. } = &mut *state else { return };
-            let next = *next;
-            *state = State::Closing { next };
-            next
+    /// The one capture, opened when it is missing, when the device changed, or when it stopped
+    /// delivering (T9). Runs off the audio thread, with no state lock held; the capture lock is held
+    /// across the open so two callers can never open the device twice.
+    fn ensure_capture(&self, device: Option<&str>) -> Result<(), VoiceError> {
+        let dead_ms = self.inner.capture_dead_ms.load(Ordering::SeqCst);
+        // Decided and detached under the lock, but neither closing the old engine nor starting the
+        // new one happens there: starting an engine can take seconds, and a lock held across it
+        // would stall every swap and the supervisor with them.
+        let (replace, stale) = {
+            let mut capture = lock(&self.inner.capture);
+            let replace = match capture.as_mut() {
+                Some(current) => {
+                    current.frames_now();
+                    !current.usable(device, dead_ms)
+                }
+                None => true,
+            };
+            (replace, if replace { capture.take() } else { None })
         };
-        close_listener(Some(armed));
-        *lock(&self.inner.state) = State::Idle { next, armed: None };
+        if let Some(mut stale) = stale {
+            stale.stream.close();
+        }
+        if !replace {
+            return Ok(());
+        }
+        let opened = self.inner.microphone.open(device, SinkSlot::default());
+        let mut capture = lock(&self.inner.capture);
+        // Two callers can both find no capture and both open one; the loser is dropped here, and
+        // `MacStream`'s own `drop` closes the engine it opened.
+        *capture = match opened {
+            Ok(stream) => Some(Capture { stream, device: device.map(str::to_string), frames: 0, moved_ms: millis() }),
+            Err(error) => return Err(error),
+        };
+        Ok(())
     }
 
     /// The detector's end of the capture: it runs on the audio thread, so it only matches, and
@@ -377,8 +421,6 @@ impl Voice {
             if !armed(&inner, id) {
                 return;
             }
-            inner.last_frame_ms.store(millis(), Ordering::SeqCst);
-            inner.frames_seen.fetch_add(1, Ordering::SeqCst);
             let Some(detection) = wake.accept(samples) else { return };
             if !armed(&inner, id) {
                 return;
@@ -394,20 +436,33 @@ impl Voice {
         self
     }
 
-    /// When the detector last received audio, in milliseconds since the epoch: `0` means the
-    /// capture is open but nothing ever arrived (S1).
-    /// How many frames the detector has received since the app started: the guard compares it with
-    /// the value at arm time to know whether this capture ever delivered anything.
+    /// How many buffers the one capture has delivered since it opened, whoever its sink is (T9): the
+    /// only measure of "the microphone is really capturing" that exists between notes too, and the
+    /// one the supervisor compares with the value it saw when the note or the detector started.
     pub fn frames_seen(&self) -> u64 {
-        self.inner.frames_seen.load(Ordering::SeqCst)
+        let mut capture = lock(&self.inner.capture);
+        capture.as_mut().map_or(0, Capture::frames_now)
     }
 
-    pub fn last_frame_ms(&self) -> u64 {
-        self.inner.last_frame_ms.load(Ordering::SeqCst)
+    /// How long a capture may deliver nothing before `arm` replaces it, shortened so a test does not
+    /// wait a second (T9).
+    pub fn set_capture_tolerance(&self, tolerance: Duration) {
+        self.inner.capture_dead_ms.store(tolerance.as_millis() as u64, Ordering::SeqCst);
     }
 
-    /// Whether a note is running right now (S4): the wake word's deadline needs it to know the
-    /// microphone is still held by a recording.
+    /// Closes the microphone: the switch went off, the device has to change, or the capture has
+    /// delivered nothing for the whole chain. The only place a live capture is closed (T9).
+    pub fn shutdown(&self) {
+        self.disarm();
+        // A note in flight goes with it: a capture that disappears under a note would never end it,
+        // because nothing watches a note while the switch is off.
+        let _ = self.cancel();
+        let capture = lock(&self.inner.capture).take();
+        if let Some(mut capture) = capture {
+            capture.stream.close();
+        }
+    }
+
     /// Whether a start is in flight and has not become a recording yet: on a flaky input (a
     /// Bluetooth headset that sleeps) the capture can open and never finish starting, and the
     /// machine would otherwise look idle while it holds the microphone.
@@ -415,16 +470,10 @@ impl Voice {
         matches!(&*lock(&self.inner.state), State::Starting { .. })
     }
 
-    /// A capture is being closed on the caller's thread: the microphone is not free yet, even
-    /// though nothing is recording and nothing is listening.
-    pub fn closing(&self) -> bool {
-        matches!(&*lock(&self.inner.state), State::Closing { .. })
-    }
-
-    /// Whether the microphone is held at all: recording, stopping, starting, or closing. `arm`
-    /// refuses anything but idle, and an arm that answers Busy is not a device problem.
+    /// Whether the microphone is held at all: recording, stopping or starting. `arm` refuses
+    /// anything but idle, and an arm that answers Busy is not a device problem.
     pub fn busy(&self) -> bool {
-        self.recording() || self.starting() || self.closing()
+        self.recording() || self.starting()
     }
 
     pub fn recording(&self) -> bool {
@@ -462,19 +511,12 @@ impl Voice {
     }
 
     fn begin(&self, requested: Option<&str>, device: Option<&str>, events: Events, woken: Option<Woken>) -> Result<(), VoiceError> {
+        // The detector gives the audio to the note by pointing the one capture at it, not by
+        // closing anything (T9).
         self.disarm();
-        // An arm that landed since `disarm` is closed as its own phase before the note's capture
-        // opens, and a listener still opening refuses the note instead of opening the device twice.
-        match self.take_armed() {
-            Some(previous) => self.close_then_idle(previous),
-            None => {}
-        }
         let recording = {
             let mut state = lock(&self.inner.state);
-            let State::Idle { next, armed } = &mut *state else { return Err(VoiceError::Busy) };
-            if armed.as_ref().is_some_and(|armed| armed.stream.is_none()) {
-                return Err(VoiceError::Busy);
-            }
+            let State::Idle { next, .. } = &mut *state else { return Err(VoiceError::Busy) };
             let recording = *next;
             *state = State::Starting { recording, cancelled: false, failure: None };
             recording
@@ -482,8 +524,8 @@ impl Voice {
         let sink = Sink { inner: Arc::downgrade(&self.inner), recording };
         let begun = self.prepare(requested, recording).and_then(|locale| {
             let mut recognition = self.inner.recognizer.begin(&locale, sink.clone())?;
-            match self.inner.microphone.open(device, AudioSink::Recording(sink)) {
-                Ok(stream) => Ok((stream, recognition)),
+            match self.ensure_capture(device) {
+                Ok(()) => Ok(recognition),
                 Err(error) => {
                     recognition.cancel();
                     Err(error)
@@ -494,12 +536,11 @@ impl Voice {
         let State::Starting { cancelled, failure, .. } = std::mem::replace(&mut *state, State::Idle { next: recording + 1, armed: None }) else {
             unreachable!("only start leaves Starting");
         };
-        let (stream, recognition) = begun?;
+        let recognition = begun?;
         let feed = Arc::new(Mutex::new(Feed { recognition, open: true }));
         let session = Session {
             recording,
             events,
-            stream: Some(stream),
             feed,
             transcript: String::new(),
             final_text: None,
@@ -510,9 +551,11 @@ impl Voice {
         let refused = if cancelled { Some(VoiceError::Cancelled) } else { failure.map(VoiceError::Failed) };
         if let Some(error) = refused {
             drop(state);
-            discard(session);
+            discard(&self.inner, session);
             return Err(error);
         }
+        // The note's audio starts here, on the capture the machine already has (T9).
+        select(&self.inner, Some(AudioSink::Recording(sink)));
         *state = State::Recording(session);
         Ok(())
     }
@@ -541,11 +584,11 @@ impl Voice {
     /// the recognizer does not answer within the timeout (the recognition's own, when it sets
     /// one, else the machine's). Blocks, so it runs off the main thread.
     pub fn stop(&self) -> Result<Transcript, VoiceError> {
-        let (recording, mut stream, feed) = {
+        let (recording, feed) = {
             let mut state = lock(&self.inner.state);
             match std::mem::replace(&mut *state, State::Idle { next: 0, armed: None }) {
-                State::Recording(mut session) => {
-                    let taken = (session.recording, session.stream.take(), session.feed.clone());
+                State::Recording(session) => {
+                    let taken = (session.recording, session.feed.clone());
                     *state = State::Stopping(session);
                     taken
                 }
@@ -561,9 +604,8 @@ impl Voice {
                 }
             }
         };
-        if let Some(stream) = stream.as_mut() {
-            stream.close();
-        }
+        // The note stops hearing the microphone; the engine stays open for the detector (T9).
+        select(&self.inner, None);
         let timeout = {
             let mut feed = lock(&feed);
             feed.finish();
@@ -598,8 +640,7 @@ impl Voice {
     pub fn cancel(&self) -> Result<(), VoiceError> {
         let mut state = lock(&self.inner.state);
         match &mut *state {
-            // A close in flight finishes on its own thread; nothing is recording to cancel.
-            State::Idle { .. } | State::Closing { .. } => Ok(()),
+            State::Idle { .. } => Ok(()),
             State::Starting { cancelled, .. } => {
                 *cancelled = true;
                 Ok(())
@@ -611,7 +652,7 @@ impl Voice {
                 };
                 drop(state);
                 self.inner.changed.notify_all();
-                discard(session);
+                discard(&self.inner, session);
                 Ok(())
             }
         }
@@ -647,10 +688,6 @@ impl Sink {
             if session.recording != self.recording {
                 return;
             }
-            // The note's capture counts frames too: without this the only measure of "this capture
-            // delivers" belongs to the detector, and a note that opened mute is invisible (T6).
-            inner.last_frame_ms.store(millis(), Ordering::SeqCst);
-            inner.frames_seen.fetch_add(1, Ordering::SeqCst);
             session.peak = session.peak.max(audio::rms(samples));
             let now = inner.clock.now_ms();
             let due = session.last_level_ms.is_none_or(|last| now.saturating_sub(last) >= LEVEL_INTERVAL_MS);
@@ -721,7 +758,7 @@ impl Sink {
                 if session.woken.is_some() {
                     (session.events)(VoiceEvent::Transcript(String::new()));
                 }
-                discard(session);
+                discard(&inner, session);
             }
             _ => {}
         }
@@ -874,15 +911,19 @@ mod tests {
     }
 
     #[test]
-    fn stop_closes_the_microphone_and_resolves_with_the_final_transcript() {
+    fn stop_detaches_the_note_from_the_capture_without_closing_it() {
         let rig = granted();
         *rig.recognizer.final_text.lock().unwrap() = Some(" Hello there. ".into());
         rig.start().unwrap();
         rig.recognizer.sink().partial("hello");
         assert_eq!(rig.voice.stop(), Ok(Transcript { text: "Hello there.".into() }));
-        assert_eq!(rig.mic.log.lock().unwrap().closed, 1);
+        let log = rig.mic.log.lock().unwrap();
+        assert_eq!(log.closed, 0, "the engine is kept for the next note or the detector (T9)");
+        assert!(log.sink.is_none(), "the note stops hearing the microphone");
+        drop(log);
         assert_eq!(rig.recognizer.log.lock().unwrap().finished, 1);
         rig.start().unwrap();
+        assert_eq!(rig.mic.log.lock().unwrap().opened, 1, "the second note reuses the same capture");
     }
 
     #[test]
@@ -905,12 +946,13 @@ mod tests {
         rig.start().unwrap();
         let old = rig.recognizer.sink();
         assert_eq!(rig.voice.cancel(), Ok(()));
-        assert_eq!(rig.mic.log.lock().unwrap().closed, 1);
+        assert_eq!(rig.mic.log.lock().unwrap().closed, 0, "the capture stays open (T9)");
         assert_eq!(rig.recognizer.log.lock().unwrap().cancelled, 1);
         rig.start().unwrap();
         old.partial("from before");
         old.failed("canceled");
         assert!(rig.recorder.seen().is_empty());
+        assert_eq!(rig.mic.log.lock().unwrap().opened, 1, "no capture per note");
         assert_eq!(rig.voice.cancel(), Ok(()));
         assert_eq!(rig.voice.cancel(), Ok(()), "cancelling when idle is harmless");
     }
@@ -1030,7 +1072,7 @@ mod tests {
         rig.start().unwrap();
         rig.mic.sink().failed(&VoiceError::Interrupted.to_string());
         assert_eq!(rig.recorder.seen(), vec![VoiceEvent::Error("The microphone was interrupted.".into())]);
-        assert_eq!(rig.mic.log.lock().unwrap().closed, 1);
+        assert_eq!(rig.mic.log.lock().unwrap().closed, 0, "a dead capture is replaced later, not closed here (T9)");
         assert_eq!(rig.recognizer.log.lock().unwrap().cancelled, 1);
         assert_eq!(rig.voice.stop(), Err(VoiceError::NotRecording));
         rig.start().unwrap();
@@ -1081,9 +1123,9 @@ mod tests {
             self.0.request_authorization()
         }
 
-        fn open(&self, device: Option<&str>, sink: crate::voice::AudioSink) -> Result<Box<dyn crate::voice::Stream>, VoiceError> {
+        fn open(&self, device: Option<&str>, slot: crate::voice::SinkSlot) -> Result<Box<dyn crate::voice::Stream>, VoiceError> {
             self.1.sink().failed("Siri and Dictation are disabled.");
-            self.0.open(device, sink)
+            self.0.open(device, slot)
         }
     }
 
@@ -1091,7 +1133,7 @@ mod tests {
     const SPEECH: f32 = 0.05;
 
     #[test]
-    fn the_listener_owns_the_microphone_until_a_recording_takes_it() {
+    fn the_listener_owns_the_audio_until_a_recording_takes_it() {
         let rig = granted();
         let wake = Arc::new(FakeWake::default());
         rig.listen(&wake).unwrap();
@@ -1099,7 +1141,8 @@ mod tests {
         assert_eq!(rig.listen(&wake), Err(VoiceError::Busy), "one listener at a time");
         assert_eq!(rig.start(), Ok(()));
         let log = rig.mic.log.lock().unwrap();
-        assert_eq!((log.closed, log.opened), (1, 2), "the listener is closed before the recording opens");
+        assert_eq!((log.closed, log.opened), (0, 1), "the note takes the capture the detector had (T9)");
+        assert!(log.recording(), "the note owns the audio now");
         drop(log);
         assert_eq!(wake.resets(), 1, "the detector drops what it had buffered");
     }
@@ -1133,15 +1176,17 @@ mod tests {
         let rig = granted();
         let wake = Arc::new(FakeWake::default());
         rig.listen(&wake).unwrap();
+        // The sink the detector had, kept so a buffer can still be handed to it after the swap.
+        let stale = rig.mic.sink();
         rig.voice.disarm();
-        assert_eq!(rig.mic.log.lock().unwrap().closed, 1);
+        assert_eq!(rig.mic.log.lock().unwrap().closed, 0, "the engine stays open between arms (T9)");
         let heard = wake.heard();
-        // Audio that arrives after the capture was closed is ignored, not matched.
-        rig.mic.sink().audio(&[0.1; 160]);
+        // Audio that arrives after the listener was disarmed is ignored, not matched.
+        stale.audio(&[0.1; 160]);
         assert_eq!(wake.heard(), heard);
         assert!(rig.listenings.settle().is_empty());
         rig.listen(&wake).unwrap();
-        assert_eq!(rig.mic.log.lock().unwrap().opened, 2);
+        assert_eq!(rig.mic.log.lock().unwrap().opened, 1, "the same capture listens again");
     }
 
     #[test]
@@ -1152,7 +1197,69 @@ mod tests {
         rig.start().unwrap();
         rig.voice.stop().unwrap();
         assert_eq!(rig.listen(&wake), Ok(()), "a finished recording leaves the listener disarmed");
-        assert_eq!(rig.mic.log.lock().unwrap().opened, 3);
+        assert_eq!(rig.mic.log.lock().unwrap().opened, 1, "the capture is the machine's, not a note's");
+    }
+
+    #[test]
+    fn a_note_and_the_detector_swap_inside_one_capture() {
+        // The measured bug (T9): 16 of 18 capture re-opens were mute, so the device is opened once
+        // and only the sink changes hands. Three cycles, then the invariant read off the fake.
+        let rig = granted();
+        let wake = Arc::new(FakeWake::default());
+        for _ in 0..3 {
+            rig.listen(&wake).unwrap();
+            assert!(rig.mic.log.lock().unwrap().listening());
+            rig.start().unwrap();
+            assert!(rig.mic.log.lock().unwrap().recording());
+            rig.feed(0.5, 10);
+            rig.voice.stop().unwrap();
+            assert!(rig.mic.log.lock().unwrap().sink.is_none(), "the note stops hearing the microphone");
+        }
+        rig.listen(&wake).unwrap();
+        let log = rig.mic.log.lock().unwrap();
+        assert_eq!((log.opened, log.closed), (1, 0), "one engine for the whole cycle: {:?}", log.history);
+        assert_eq!(log.overlap, 0, "nothing is ever opened twice");
+        assert_eq!(log.selected.iter().filter(|sink| **sink == "recording").count(), 3);
+        assert_eq!(log.selected.iter().filter(|sink| **sink == "listener").count(), 4);
+    }
+
+    #[test]
+    fn the_microphone_is_closed_only_by_shutdown() {
+        let rig = granted();
+        let wake = Arc::new(FakeWake::default());
+        rig.listen(&wake).unwrap();
+        rig.start().unwrap();
+        rig.voice.stop().unwrap();
+        rig.listen(&wake).unwrap();
+        assert_eq!(rig.mic.log.lock().unwrap().closed, 0);
+        rig.voice.shutdown();
+        let log = rig.mic.log.lock().unwrap();
+        assert_eq!((log.opened, log.closed), (1, 1), "shutdown is where the engine ends (T9)");
+        assert!(log.sink.is_none(), "nothing is delivered to a closed capture");
+    }
+
+    #[test]
+    fn a_capture_that_stopped_delivering_is_replaced_by_the_next_arm() {
+        // The platform reports a lost device by no longer bumping the engine's own counter; with no
+        // sink attached between notes that counter is the only witness there is (T9).
+        let rig = granted();
+        let wake = Arc::new(FakeWake::default());
+        rig.listen(&wake).unwrap();
+        // A capture that keeps delivering is reused: a swap must not reopen the device.
+        rig.feed(0.5, 10);
+        rig.voice.disarm();
+        std::thread::sleep(Duration::from_millis(30));
+        rig.listen(&wake).unwrap();
+        assert_eq!(rig.mic.log.lock().unwrap().opened, 1, "a live capture is reused, not reopened");
+        // One that delivered nothing for longer than the tolerance lost the device. The fake only
+        // bumps its counter when audio is played, so time alone makes this capture dead.
+        rig.voice.set_capture_tolerance(Duration::from_millis(20));
+        rig.voice.disarm();
+        std::thread::sleep(Duration::from_millis(40));
+        rig.listen(&wake).unwrap();
+        let log = rig.mic.log.lock().unwrap();
+        assert_eq!((log.opened, log.closed), (2, 1), "the mute capture is replaced: {:?}", log.history);
+        assert_eq!(log.overlap, 0, "the old engine is closed before the new one opens");
     }
 
     #[test]

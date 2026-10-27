@@ -21,6 +21,12 @@
 //! The wake word (S30.7, `wake`) reads that same capture instead of opening one of its own (S2):
 //! `AudioSink` sends the microphone's PCM either to a recording or to the idle listener, never
 //! to both, so there is one AVAudioEngine, one resampler and one tap at a time.
+//!
+//! That one capture is the machine's, not a note's (T9): opening one per note produced a mute
+//! capture 16 times out of 18 on the machine this was measured on, so the engine is opened when the
+//! microphone is first needed and kept until the switch goes off or the device changes. `SinkSlot`
+//! is how it changes hands (`Stream::select`) and `Stream::frames` is how its liveness is read while
+//! no sink is attached.
 
 pub mod app;
 pub mod audio;
@@ -46,7 +52,7 @@ pub use macos::{AppleSpeech, MacMicrophone};
 
 use serde::Serialize;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Live text while the user speaks: `{text}`.
@@ -215,20 +221,27 @@ pub(crate) fn configuration_change(engine_running: bool) -> Option<VoiceError> {
 /// it, so it must come from the microphone that recognition was made for.
 pub type NativeAudio = dyn std::any::Any;
 
-/// Native audio capture. Delivers `audio::SAMPLE_RATE` mono f32 chunks to the `AudioSink`, its
-/// one consumer: a recording or the wake word's listener (S2).
+/// Where an open capture delivers its audio, or nothing while no owner wants it (T9). The machine
+/// writes it through `Stream::select`: the platform's tap reads it once per buffer, so a swap costs
+/// an `Arc` clone and never a device.
+pub type SinkSlot = Arc<RwLock<Option<AudioSink>>>;
+
+/// Native audio capture. Delivers `audio::SAMPLE_RATE` mono f32 chunks to the `AudioSink` its slot
+/// holds, its one consumer at a time: a recording or the wake word's listener (S2).
 pub trait Microphone: Send + Sync {
     /// The current permission, without prompting.
     fn authorization(&self) -> Authorization;
     /// Prompts when not yet determined. Blocks until the user answers: never on the main thread.
     fn request_authorization(&self) -> Authorization;
     /// Opens the capture from `device` (a CoreAudio UID), or from the system default input when
-    /// it is `None` or when that device is gone, and delivers its audio to `sink`.
-    fn open(&self, device: Option<&str>, sink: AudioSink) -> Result<Box<dyn Stream>, VoiceError>;
+    /// it is `None` or when that device is gone, and delivers its audio to whatever `slot` holds
+    /// when each buffer arrives.
+    fn open(&self, device: Option<&str>, slot: SinkSlot) -> Result<Box<dyn Stream>, VoiceError>;
 }
 
-/// Where an open capture delivers its audio. One capture has one consumer, so a recording and
-/// the wake word never share a stream and no device is opened twice.
+/// Where an open capture delivers its audio. A capture has one consumer at a time, so a recording
+/// and the wake word never share the audio and no device is opened twice: the slot is swapped
+/// between them instead (T9).
 #[derive(Clone)]
 pub enum AudioSink {
     /// A recording: metered, recognized, and reported to the webview.
@@ -267,9 +280,17 @@ impl AudioSink {
     }
 }
 
-/// An open capture.
+/// An open capture: one engine, kept across notes and handed between sinks (T9).
 pub trait Stream: Send {
+    /// Stops the engine and releases the device. Only the end of the microphone's life reaches
+    /// here: the switch going off, the machine shutting down, giving up, or a device change.
     fn close(&mut self);
+    /// Points the capture at `sink`, or at nothing, keeping the engine open.
+    fn select(&mut self, sink: Option<AudioSink>);
+    /// Buffers the engine has delivered since it opened, whoever the sink is: the only liveness a
+    /// capture has while no sink is attached, and the signal that separates a running engine from
+    /// a device that went away.
+    fn frames(&self) -> u64;
 }
 
 /// Speech to text over the microphone's PCM. Results arrive through `Sink::partial`,

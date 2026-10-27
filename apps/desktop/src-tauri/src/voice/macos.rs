@@ -12,10 +12,14 @@
 //! results all arrive off the main thread (the recognizer gets an operation queue of its own),
 //! and they only call the `Sink`. The objects below are used from the command's blocking thread
 //! and from those callbacks; AVAudioEngine and the Speech request are not tied to a thread.
+//!
+//! One engine serves the app (T9): `MacStream` keeps its input tap installed and only the sink the
+//! tap reads changes, so starting a note never opens the device — the re-open was what produced a
+//! mute capture on this machine.
 
 use super::audio::{self, Resampler, SAMPLE_RATE};
 use super::core_audio;
-use super::{AudioSink, Authorization, Microphone, NativeAudio, Recognition, Recognizer, Sink, Stream, VoiceError};
+use super::{AudioSink, Authorization, Microphone, NativeAudio, Recognition, Recognizer, Sink, SinkSlot, Stream, VoiceError};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
@@ -32,7 +36,8 @@ use objc2_speech::{
 use std::cell::RefCell;
 use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
 /// Frames per tap callback at the device rate (about 21 ms at 48 kHz).
 const TAP_FRAMES: u32 = 1_024;
@@ -97,12 +102,15 @@ impl Microphone for MacMicrophone {
         }
     }
 
-    fn open(&self, device: Option<&str>, sink: AudioSink) -> Result<Box<dyn Stream>, VoiceError> {
+    fn open(&self, device: Option<&str>, slot: SinkSlot) -> Result<Box<dyn Stream>, VoiceError> {
+        // One counter for the whole engine: the tap bumps it whether or not a sink is attached, so
+        // "the engine is running and delivering" is observable between notes too (T9).
+        let frames = Arc::new(AtomicU64::new(0));
         // The device the user chose is a preference, not a condition: when it is refused or
         // throws, the system default is opened and the note is recorded anyway (S3).
-        let (started, refused) = match attempt(device, &sink) {
+        let (started, refused) = match attempt(device, &slot, &frames) {
             Ok(started) => (started, None),
-            Err(why) if device.is_some() => (attempt(None, &sink)?, Some(why)),
+            Err(why) if device.is_some() => (attempt(None, &slot, &frames)?, Some(why)),
             Err(why) => return Err(why),
         };
         let Started { engine, tap, opened, rate, channels } = started;
@@ -128,6 +136,9 @@ impl Microphone for MacMicrophone {
             || VoiceError::Interrupted.to_string(),
             |opened| format!("The microphone \"{}\" was disconnected.", opened.name),
         );
+        // The loss is reported through whoever owns the capture at that moment: the sink is
+        // swapped between the detector and a note without reopening the device (T9).
+        let lost_slot = slot.clone();
         let interrupted = RcBlock::new(move |note: NonNull<NSNotification>| {
             // SAFETY: the notification is valid for the call; its object is the observed engine.
             let note = unsafe { note.as_ref() };
@@ -138,7 +149,11 @@ impl Microphone for MacMicrophone {
                 .and_then(|object| object.downcast_ref::<AVAudioEngine>())
                 .is_some_and(|engine| unsafe { engine.isRunning() });
             if super::configuration_change(running).is_some() {
-                sink.failed(&lost);
+                // Read and released before the call: the audio thread takes this lock for its clone.
+                let sink = lost_slot.read().ok().and_then(|slot| slot.clone());
+                if let Some(sink) = sink {
+                    sink.failed(&lost);
+                }
             }
         });
         let engine_object: &AnyObject = &engine;
@@ -152,7 +167,7 @@ impl Microphone for MacMicrophone {
                 &interrupted,
             )
         };
-        Ok(Box::new(MacStream { engine, observer, _tap: tap, open: true }))
+        Ok(Box::new(MacStream { engine, observer, _tap: tap, slot, frames, open: true }))
     }
 }
 
@@ -180,7 +195,7 @@ fn opening(device: Option<&str>) -> String {
 }
 
 /// One attempt at opening `device`, or the system default input when it is `None`.
-fn attempt(device: Option<&str>, sink: &AudioSink) -> Result<Started, VoiceError> {
+fn attempt(device: Option<&str>, slot: &SinkSlot, frames: &Arc<AtomicU64>) -> Result<Started, VoiceError> {
     // SAFETY: plain constructors and getters on a new engine.
     let engine = unsafe { AVAudioEngine::new() };
     // SAFETY: the engine's own input node.
@@ -191,7 +206,7 @@ fn attempt(device: Option<&str>, sink: &AudioSink) -> Result<Started, VoiceError
     // `__rust_panic_cleanup`), so the whole sequence is caught and comes back as a value.
     // shortcut: a caught exception skips the drops of the closure's own locals, so a refused
     // attempt leaks that engine; the system reclaims it at quit.
-    let caught = objc2::exception::catch(AssertUnwindSafe(move || start(engine, input, device, sink)));
+    let caught = objc2::exception::catch(AssertUnwindSafe(move || start(engine, input, device, slot, frames)));
     match caught {
         Ok(started) => started,
         Err(exception) => {
@@ -207,7 +222,8 @@ fn start(
     engine: Retained<AVAudioEngine>,
     input: Retained<AVAudioInputNode>,
     device: Option<&str>,
-    sink: &AudioSink,
+    slot: &SinkSlot,
+    frames: &Arc<AtomicU64>,
 ) -> Result<Started, VoiceError> {
     // The device belongs to the input node's audio unit, so it is chosen before `prepare()`; the
     // format read below is then the one that device carries. A device that already is the system
@@ -226,8 +242,17 @@ fn start(
         return Err(VoiceError::NoMicrophone);
     }
     let resampler = RefCell::new(Resampler::new(rate));
-    let audio_sink = sink.clone();
+    let tap_slot = slot.clone();
+    let tap_frames = frames.clone();
     let tap = RcBlock::new(move |buffer: NonNull<AVAudioPCMBuffer>, _when: NonNull<AVAudioTime>| {
+        // The engine is alive whatever happens next: a buffer with no sink is still the device
+        // delivering, and that is how a capture is known healthy between notes (T9).
+        tap_frames.fetch_add(1, Ordering::Relaxed);
+        // Who this buffer goes to right now, cloned and released before any work: the swap between
+        // a note and the detector happens on another thread and must never wait for the tap.
+        let sink = tap_slot.read().ok().and_then(|slot| slot.clone());
+        // Nobody is listening: the engine keeps running and the device stays open.
+        let Some(sink) = sink else { return };
         // SAFETY: the engine passes a valid buffer in the input node's format (deinterleaved
         // float32 with `channels` channels), valid for the duration of the call.
         let buffer = unsafe { buffer.as_ref() };
@@ -242,7 +267,7 @@ fn start(
             .collect();
         let pcm = resampler.borrow_mut().process(&audio::mono(&planes));
         // The buffer itself goes along for Apple Speech, which appends it as captured.
-        audio_sink.audio_native(&pcm, buffer as &NativeAudio);
+        sink.audio_native(&pcm, buffer as &NativeAudio);
     });
     let tap_block = &*tap as *const block2::DynBlock<_> as *mut block2::DynBlock<_>;
     // SAFETY: the block matches AVAudioNodeTapBlock and stays alive in the returned `Started`.
@@ -263,6 +288,9 @@ struct MacStream {
     engine: Retained<AVAudioEngine>,
     observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     _tap: RcBlock<dyn Fn(NonNull<AVAudioPCMBuffer>, NonNull<AVAudioTime>)>,
+    /// Where the tap reads its consumer from: written by `select`, never by the device.
+    slot: SinkSlot,
+    frames: Arc<AtomicU64>,
     open: bool,
 }
 
@@ -282,6 +310,18 @@ impl Stream for MacStream {
             self.engine.stop();
             self.engine.inputNode().removeTapOnBus(0);
         }
+    }
+
+    fn select(&mut self, sink: Option<AudioSink>) {
+        // A poisoned lock would leave the tap reading an older sink, which is still better than a
+        // panic on the swap: the stale sink filters itself by its own id.
+        if let Ok(mut slot) = self.slot.write() {
+            *slot = sink;
+        }
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
     }
 }
 

@@ -29,7 +29,7 @@ nothing. This task is an audit, not another patch: the design is under suspicion
 | T5 ✅ `051e264` | S2, S4 | Supervisor: one owner of `(enabled, capture, delivering)`; the only caller of arm/disarm/resume; every other actor sends it an intent | — |
 | T6 ✅ `051e264` | S2 | Liveness for both sinks: a frame count per capture (Listener and Recording), so "open and mute" is observed where it happens | — |
 | T7 ✅ `509041a` | S5 | One state contract: `voice://state {wake, capture, mic}` on every transition; the panel mirrors it, and `set` rolls back so the switch never lies | — |
-| T9 | S3 | One audio engine for the app's life: open once, swap the sink between detector and note, close only when the switch goes off or the device changes | — |
+| T9 ✅ (ver Log L7) | S3 | One audio engine for the app's life: open once, swap the sink between detector and note, close only when the switch goes off or the device changes | — |
 | T8 | S3 | Device chain in one place (chosen → default → built-in) with the sticky flags reset when frames arrive | — |
 
 ## Log
@@ -59,3 +59,10 @@ nothing. This task is an audit, not another patch: the design is under suspicion
   so a freshly opened capture is mute on this machine. The user approved T9 (one engine, swappable
   sink). Process: an exploration agent checks the plan against the real audio thread first, then a
   worker implements it, then the parent reviews the diff, runs the checks and commits.
+- L7 — T9 delivered (exploration `mvqr0g6p`, worker `mvqr3swv`, reviewed by the parent). One engine
+  per switch-on with a `SinkSlot` the tap reads per buffer; the capture is a machine resource and
+  every note is a `select`, so the mute-capture churn is gone by construction. The parent moved the
+  engine open and the stale close out of the capture lock: starting an engine can take seconds, and
+  a lock held across it would stall every swap. `cargo test`: 484 passed, 4 ignored. Field checks
+  still owed: one engine per switch-on, a device switch while listening, and Apple Speech on notes
+  2 and 3.
